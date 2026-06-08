@@ -1,4 +1,0 @@
-defaults:
-  - TrainCPLightDiT
-  - _self_
-

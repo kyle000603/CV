@@ -1,3 +1,0 @@
-mse:
-  _target_: losses.mse.MSELoss
-
