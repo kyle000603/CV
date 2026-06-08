@@ -1,0 +1,55 @@
+defaults:
+  - TrainCPLightDiT
+  - _self_
+
+project: CPLightDiT
+note: ray_encoder_pretrain
+stage: ray_pretrain
+loss_mode: minimal
+
+result_name: RayEncoder
+epochs: 20
+batch_size: 64
+log_every: 50
+save_every: 1
+keep_last_checkpoints: 3
+
+assets:
+  sit_pretrained:
+    enabled: false
+    load: false
+
+allow_freeze_without_pretrain: true
+
+feature_dim: 64
+token_grid_size: 8
+token_count: 64
+
+model:
+  input_size: 8
+  in_channels: 64
+  depth: 2
+  hidden_size: 128
+  num_heads: 4
+  mlp_ratio: 2.0
+  light_dim: 9
+  dense_cond_channels: 18
+
+light_encoder:
+  hidden_dim: 256
+  light_dim: 3
+  extended: false
+
+freeze_backbone: true
+freeze_ray_encoder: false
+freeze_light_encoder: false
+freeze_tokenizer: true
+train_condition_adapters_only: false
+train_light_transfer_transformer: false
+
+lambda_flow: 0.0
+lambda_transfer: 0.0
+lambda_light_encoder: 1.0
+
+enable_image_space_losses: false
+decode_loss_every: 0

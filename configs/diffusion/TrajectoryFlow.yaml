@@ -1,0 +1,10 @@
+train:
+  timestep_shift: 0.2
+
+inference:
+  timestep_shift: 0.15
+  mode: euler
+  sample_steps: 25
+  cfg: 1.0
+  cfg_mode: constant
+

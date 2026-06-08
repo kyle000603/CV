@@ -1,0 +1,9 @@
+_target_: dataset.dataloader.base.DataModule
+global_seed: ${global_seed}
+global_batch_size: ${batch_size}
+num_workers: ${num_workers}
+pin_memory: true
+persistent_workers: true
+prefetch_factor: 2
+drop_last: true
+
