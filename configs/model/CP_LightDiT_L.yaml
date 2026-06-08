@@ -1,0 +1,21 @@
+_target_: models.diffusion.CP_LightDiT.CPLightDiT
+input_size: 16
+num_classes: 1
+patch_size: 1
+depth: 24
+hidden_size: 1024
+num_heads: 16
+mlp_ratio: 4.0
+use_swiglu: false
+in_channels: ${feature_dim}
+learn_sigma: false
+qk_norm: true
+class_dropout_prob: 0.0
+light_dim: 9
+dense_cond_channels: 10
+use_dense_condition: true
+use_source_tokens: true
+light_drop_prob: 0.05
+dense_drop_prob: 0.05
+source_drop_prob: 0.0
+

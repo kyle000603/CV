@@ -1,0 +1,52 @@
+image_key: image
+source_image_key: source_image
+target_image_key: target_image
+source_light_key: source_light
+target_light_key: target_light
+light_cond_key: light_cond
+source_ray_key: source_ray
+target_ray_key: target_ray
+delta_angle_key: delta_angle
+mask_key: mask
+y_key: y
+depth_key: depth
+depth_valid_key: depth_valid
+
+train:
+  _target_: dataset.data.vidit.VIDITRelightingDataset
+  root: data/VIDIT_HF
+  split: train
+  image_size: ${image_size}
+  mask_size: ${mask_size}
+  fixed_color_temperature: true
+  use_depth: true
+  extended_light: false
+  track1_source_direction: N
+  track1_target_direction: E
+  track1_temperature: 5500
+
+val:
+  _target_: dataset.data.vidit.VIDITRelightingDataset
+  root: data/VIDIT_HF
+  split: val
+  image_size: ${image_size}
+  mask_size: ${mask_size}
+  fixed_color_temperature: true
+  use_depth: true
+  extended_light: false
+  track1_source_direction: N
+  track1_target_direction: E
+  track1_temperature: 5500
+
+test:
+  _target_: dataset.data.vidit.VIDITRelightingDataset
+  root: data/VIDIT_HF
+  split: val
+  image_size: ${image_size}
+  mask_size: ${mask_size}
+  fixed_color_temperature: true
+  use_depth: true
+  extended_light: false
+  track1_source_direction: N
+  track1_target_direction: E
+  track1_temperature: 5500

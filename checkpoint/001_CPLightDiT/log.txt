@@ -1,0 +1,86 @@
+Writing process output to checkpoint/001_CPLightDiT/log.txt
+Using existing Hugging Face VIDIT conversion under data/VIDIT_HF (12000 RGB images)
+Downloading https://www.dl.dropboxusercontent.com/scl/fi/as9oeomcbub47de5g4be0/SiT-XL-2-256.pt?rlkey=uxzxmpicu46coq3msb17b9ofa&dl=0 -> pretrained/SiT-XL-2-256x256.pt
+Error executing job with overrides: []
+Traceback (most recent call last):
+  File "/home/jovyan/irrlab/anaconda3/envs/CV/lib/python3.11/urllib/request.py", line 1348, in do_open
+    h.request(req.get_method(), req.selector, req.data, headers,
+  File "/home/jovyan/irrlab/anaconda3/envs/CV/lib/python3.11/http/client.py", line 1303, in request
+    self._send_request(method, url, body, headers, encode_chunked)
+  File "/home/jovyan/irrlab/anaconda3/envs/CV/lib/python3.11/http/client.py", line 1349, in _send_request
+    self.endheaders(body, encode_chunked=encode_chunked)
+  File "/home/jovyan/irrlab/anaconda3/envs/CV/lib/python3.11/http/client.py", line 1298, in endheaders
+    self._send_output(message_body, encode_chunked=encode_chunked)
+  File "/home/jovyan/irrlab/anaconda3/envs/CV/lib/python3.11/http/client.py", line 1058, in _send_output
+    self.send(msg)
+  File "/home/jovyan/irrlab/anaconda3/envs/CV/lib/python3.11/http/client.py", line 996, in send
+    self.connect()
+  File "/home/jovyan/irrlab/anaconda3/envs/CV/lib/python3.11/http/client.py", line 1468, in connect
+    super().connect()
+  File "/home/jovyan/irrlab/anaconda3/envs/CV/lib/python3.11/http/client.py", line 962, in connect
+    self.sock = self._create_connection(
+                ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/jovyan/irrlab/anaconda3/envs/CV/lib/python3.11/socket.py", line 863, in create_connection
+    raise exceptions[0]
+  File "/home/jovyan/irrlab/anaconda3/envs/CV/lib/python3.11/socket.py", line 848, in create_connection
+    sock.connect(sa)
+OSError: [Errno 99] Cannot assign requested address
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/home/jovyan/CV/train.py", line 219, in <module>
+    main()
+  File "/home/jovyan/irrlab/anaconda3/envs/CV/lib/python3.11/site-packages/hydra/main.py", line 94, in decorated_main
+    _run_hydra(
+  File "/home/jovyan/irrlab/anaconda3/envs/CV/lib/python3.11/site-packages/hydra/_internal/utils.py", line 394, in _run_hydra
+    _run_app(
+  File "/home/jovyan/irrlab/anaconda3/envs/CV/lib/python3.11/site-packages/hydra/_internal/utils.py", line 457, in _run_app
+    run_and_report(
+  File "/home/jovyan/irrlab/anaconda3/envs/CV/lib/python3.11/site-packages/hydra/_internal/utils.py", line 223, in run_and_report
+    raise ex
+  File "/home/jovyan/irrlab/anaconda3/envs/CV/lib/python3.11/site-packages/hydra/_internal/utils.py", line 220, in run_and_report
+    return func()
+           ^^^^^^
+  File "/home/jovyan/irrlab/anaconda3/envs/CV/lib/python3.11/site-packages/hydra/_internal/utils.py", line 458, in <lambda>
+    lambda: hydra.run(
+            ^^^^^^^^^^
+  File "/home/jovyan/irrlab/anaconda3/envs/CV/lib/python3.11/site-packages/hydra/_internal/hydra.py", line 132, in run
+    _ = ret.return_value
+        ^^^^^^^^^^^^^^^^
+  File "/home/jovyan/irrlab/anaconda3/envs/CV/lib/python3.11/site-packages/hydra/core/utils.py", line 260, in return_value
+    raise self._return_value
+  File "/home/jovyan/irrlab/anaconda3/envs/CV/lib/python3.11/site-packages/hydra/core/utils.py", line 186, in run_job
+    ret.return_value = task_function(task_cfg)
+                       ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/jovyan/CV/train.py", line 209, in main
+    _prepare_assets_once_before_ddp(cfg)
+  File "/home/jovyan/CV/train.py", line 164, in _prepare_assets_once_before_ddp
+    checkpoint_path = ensure_pretrained_checkpoint(cfg)
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/jovyan/CV/trainers/assets.py", line 434, in ensure_pretrained_checkpoint
+    return ensure_file(url, path, sha256=str(checksum) if checksum else None)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/jovyan/CV/trainers/assets.py", line 73, in ensure_file
+    _download_url(url, path)
+  File "/home/jovyan/CV/trainers/assets.py", line 48, in _download_url
+    with urllib.request.urlopen(url) as response, temp_path.open("wb") as handle:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/jovyan/irrlab/anaconda3/envs/CV/lib/python3.11/urllib/request.py", line 216, in urlopen
+    return opener.open(url, data, timeout)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/jovyan/irrlab/anaconda3/envs/CV/lib/python3.11/urllib/request.py", line 519, in open
+    response = self._open(req, data)
+               ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/jovyan/irrlab/anaconda3/envs/CV/lib/python3.11/urllib/request.py", line 536, in _open
+    result = self._call_chain(self.handle_open, protocol, protocol +
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/jovyan/irrlab/anaconda3/envs/CV/lib/python3.11/urllib/request.py", line 496, in _call_chain
+    result = func(*args)
+             ^^^^^^^^^^^
+  File "/home/jovyan/irrlab/anaconda3/envs/CV/lib/python3.11/urllib/request.py", line 1391, in https_open
+    return self.do_open(http.client.HTTPSConnection, req,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/jovyan/irrlab/anaconda3/envs/CV/lib/python3.11/urllib/request.py", line 1351, in do_open
+    raise URLError(err)
+urllib.error.URLError: <urlopen error [Errno 99] Cannot assign requested address>

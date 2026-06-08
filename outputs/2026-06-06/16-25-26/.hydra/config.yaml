@@ -1,0 +1,187 @@
+dataset:
+  image_key: image
+  source_image_key: source_image
+  target_image_key: target_image
+  source_light_key: source_light
+  target_light_key: target_light
+  light_cond_key: light_cond
+  source_ray_key: source_ray
+  target_ray_key: target_ray
+  delta_angle_key: delta_angle
+  mask_key: mask
+  y_key: 'y'
+  depth_key: depth
+  depth_valid_key: depth_valid
+  train:
+    _target_: dataset.data.vidit.VIDITRelightingDataset
+    root: data/VIDIT
+    split: train
+    image_size: ${image_size}
+    mask_size: ${mask_size}
+    fixed_color_temperature: true
+    use_depth: true
+    extended_light: false
+  val:
+    _target_: dataset.data.vidit.VIDITRelightingDataset
+    root: data/VIDIT
+    split: val
+    image_size: ${image_size}
+    mask_size: ${mask_size}
+    fixed_color_temperature: true
+    use_depth: true
+    extended_light: false
+  test:
+    _target_: dataset.data.vidit.VIDITRelightingDataset
+    root: data/VIDIT
+    split: test
+    image_size: ${image_size}
+    mask_size: ${mask_size}
+    fixed_color_temperature: true
+    use_depth: true
+    extended_light: false
+dataloader:
+  _target_: dataset.dataloader.base.DataModule
+  global_seed: ${global_seed}
+  global_batch_size: ${batch_size}
+  num_workers: ${num_workers}
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 2
+  drop_last: true
+model:
+  _target_: models.diffusion.CP_LightDiT.CPLightDiT
+  input_size: 16
+  num_classes: 1
+  patch_size: 1
+  depth: 28
+  hidden_size: 1152
+  num_heads: 16
+  mlp_ratio: 4.0
+  use_swiglu: false
+  in_channels: ${feature_dim}
+  learn_sigma: false
+  qk_norm: true
+  class_dropout_prob: 0.0
+  light_dim: 9
+  dense_cond_channels: 10
+  use_dense_condition: true
+  use_source_tokens: true
+  light_drop_prob: 0.05
+  dense_drop_prob: 0.05
+  source_drop_prob: 0.0
+loss:
+  mse:
+    _target_: losses.mse.MSELoss
+trainer:
+  _target_: trainers.trainCPLightDiT.CPLightDiTTrainer
+  _partial_: true
+  _recursive_: false
+  validation_start_epoch: 50
+  sample_seed: null
+  visual_seed: null
+optimizer:
+  parameters:
+    clip_grad_norm: 1.0
+  adamw:
+    _target_: torch.optim.AdamW
+    _partial_: true
+    lr: 0.0001
+    weight_decay: 0.01
+    betas:
+    - 0.9
+    - 0.999
+diffusion:
+  train:
+    timestep_shift: 0.2
+  inference:
+    timestep_shift: 0.15
+    mode: euler
+    sample_steps: 25
+    cfg: 1.0
+    cfg_mode: constant
+wandb:
+  project: ${project}
+  entity: null
+  name: ${note}
+  mode: online
+project: CPLightDiT
+note: vidit_shadow_consistent_light_transfer
+image_size: 256
+mask_size: 16
+num_workers: 4
+batch_size: 16
+global_seed: 0
+epochs: 100
+result_root: checkpoint
+result_name: CPLightDiT
+result_index_width: 3
+use_numbered_result_dir: true
+result_dir: checkpoint/001_CPLightDiT
+log_every: 100
+save_every: 1
+keep_last_checkpoints: 5
+checkpoint: null
+feature_dim: 392
+token_grid_size: 16
+token_count: 256
+use_gt_source_light_prob: 0.5
+freeze_backbone: false
+freeze_light_encoder: false
+enable_image_space_losses: true
+decode_loss_every: 1
+debug_one_batch: false
+lambda_flow: 1.0
+lambda_transfer: 1.0
+lambda_shadow: 1.0
+lambda_refl: 0.1
+lambda_phys: 0.2
+lambda_smooth: 0.01
+lambda_light_encoder: 0.1
+lambda_linear: 0.1
+lambda_rotation: 0.1
+lambda_token_recon: 0.1
+lambda_endpoint_shadow: 1.0
+lambda_endpoint_transfer: 0.5
+lambda_endpoint_image: 0.5
+light_encoder:
+  _target_: models.modules.ray_encoder.RayEncoder
+  light_dim: 3
+  hidden_dim: 256
+  extended: false
+physics_light_transfer:
+  _target_: models.modules.physics_light_transfer.PhysicsLightTransfer
+  tau_remove: 0.15
+  tau_create: 0.15
+  prior_temperature: 0.05
+  use_visibility: false
+light_transfer_transformer:
+  _target_: models.modules.light_transfer_transformer.LightTransferTransformer
+  in_image_channels: 3
+  light_dim: 3
+  hidden_size: 256
+  depth: 4
+  num_heads: 4
+  patch_size: 8
+  dropout: 0.0
+assets:
+  vidit:
+    enabled: true
+    root: data/VIDIT
+    min_images: 100
+    archives:
+    - url: https://datasets.epfl.ch/vidit/NTIRE2021/track1_train.zip
+      path: data/archives/track1_train.zip
+      extract_to: data/VIDIT
+    - url: https://datasets.epfl.ch/vidit/NTIRE2021/track1_validation.zip
+      path: data/archives/track1_validation.zip
+      extract_to: data/VIDIT
+    - url: https://datasets.epfl.ch/vidit/NTIRE2021/track1_validation_gt.zip
+      path: data/archives/track1_validation_gt.zip
+      extract_to: data/VIDIT
+  sit_pretrained:
+    enabled: true
+    load: true
+    require_match: false
+    url: https://www.dl.dropboxusercontent.com/scl/fi/as9oeomcbub47de5g4be0/SiT-XL-2-256.pt?rlkey=uxzxmpicu46coq3msb17b9ofa&dl=0
+    path: pretrained/SiT-XL-2-256x256.pt
+    sha256: null
