@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import sys
+import os
+import shutil
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -10,15 +14,27 @@ from hydra.utils import instantiate
 from omegaconf import DictConfig, OmegaConf
 from tqdm import tqdm
 
-from losses.light_transfer import compute_dense_transfer_loss
+from losses.light_transfer import compute_dense_transfer_loss, compute_log_luminance_transfer
+from models.modules.light_utils import DIRECTION_TO_ANGLE
 from models.modules.light_utils import light_to_ray, ray_to_light, rotate_ray_z
-from models.modules.simple_tokenizer import SimpleImageTokenizer
 from rectified_flow.trajectory_flow import TrajectoryFlow
 from trainers.base import Trainer
+from trainers.file_logging import unwrap_terminal_stream
 from trainers.utils import count_parameters, count_trainable_parameters, set_requires_grad, unwrap_model
 
 
 class CPLightSiTTrainer(Trainer):
+    _CONDITION_ADAPTER_MODULES = [
+        "light_mlp",
+        "dense_proj",
+        "source_proj",
+        "cross_light_proj",
+        "cross_dense_proj",
+        "cross_source_proj",
+        "cross_type_embed",
+        "cross_attn_blocks",
+    ]
+
     def __init__(
         self,
         config: DictConfig,
@@ -36,33 +52,42 @@ class CPLightSiTTrainer(Trainer):
             raise ValueError("Only loss_mode='minimal' is supported. Old auxiliary losses were removed.")
 
         light_encoder = instantiate(config.light_encoder)
-        physics_light_transfer = instantiate(config.physics_light_transfer)
-        light_transfer_transformer = instantiate(config.light_transfer_transformer)
-        tokenizer = SimpleImageTokenizer(
-            image_size=int(config.image_size),
-            token_grid_size=int(config.token_grid_size),
-            feature_dim=int(config.feature_dim),
-        )
-        self.physics_light_transfer = physics_light_transfer
+        models: dict[str, nn.Module] = {"model": model, "light_encoder": light_encoder}
+        self.physics_light_transfer: nn.Module | None = None
+        needs_physics = self.stage != "ray_pretrain" or float(config.get("lambda_ray_physics", 0.0)) > 0.0
+        if needs_physics:
+            self.physics_light_transfer = instantiate(config.physics_light_transfer)
+        if self.stage != "ray_pretrain":
+            models["light_transfer_transformer"] = instantiate(config.light_transfer_transformer)
+            models["tokenizer"] = instantiate(config.tokenizer)
         super().__init__(
             config=config,
-            models={
-                "model": model,
-                "light_encoder": light_encoder,
-                "light_transfer_transformer": light_transfer_transformer,
-                "tokenizer": tokenizer,
-            },
+            models=models,
         )
         self.model = self.models["model"]
         self.light_encoder = self.models["light_encoder"]
-        self.light_transfer_transformer = self.models["light_transfer_transformer"]
-        self.tokenizer = unwrap_model(self.models["tokenizer"])
+        self.light_transfer_transformer = self.models.get("light_transfer_transformer")
+        self.tokenizer = unwrap_model(self.models["tokenizer"]) if "tokenizer" in self.models else None
         self.diffusion = TrajectoryFlow(self.model)
         self.global_step = 0
+        self._setup_amp()
+
+    def _setup_amp(self) -> None:
+        self.amp_enabled = self.device.type == "cuda" and bool(self.config.get("amp_enabled", True))
+        dtype_name = str(self.config.get("amp_dtype", "bfloat16")).lower()
+        self.amp_dtype = torch.float16 if dtype_name in {"fp16", "float16", "half"} else torch.bfloat16
+        scaler_enabled = self.amp_enabled and self.amp_dtype == torch.float16
+        self.grad_scaler = torch.amp.GradScaler("cuda", enabled=scaler_enabled)
+
+    def _autocast(self) -> object:
+        if not self.amp_enabled:
+            return nullcontext()
+        return torch.autocast(device_type="cuda", dtype=self.amp_dtype)
 
     def setup_models(self) -> None:
         super().setup_models()
-        self.physics_light_transfer = self.physics_light_transfer.to(self.device)
+        if self.physics_light_transfer is not None:
+            self.physics_light_transfer = self.physics_light_transfer.to(self.device)
         self._apply_trainable_policy()
         self._print_trainable_parameter_counts()
 
@@ -77,6 +102,13 @@ class CPLightSiTTrainer(Trainer):
                 raise RuntimeError(message + " Set allow_freeze_without_pretrain=true to allow this explicitly.")
             if self.rank == 0:
                 print(message)
+
+    def setup_datasets(self) -> None:
+        if self.stage == "ray_pretrain":
+            self.train_dataset = instantiate(self.config.dataset.train)
+            self.val_dataset = self.train_dataset
+            return
+        super().setup_datasets()
 
     def _extract_ray_encoder_state_dict(self, checkpoint: object) -> dict[str, torch.Tensor]:
         if not isinstance(checkpoint, dict):
@@ -103,7 +135,18 @@ class CPLightSiTTrainer(Trainer):
             return
         checkpoint_path = Path(str(checkpoint_value))
         if not checkpoint_path.exists():
-            raise FileNotFoundError(f"RayEncoder checkpoint does not exist: {checkpoint_path}")
+            candidates = [
+                checkpoint_path.parent / "checkpoint" / checkpoint_path.name,
+                checkpoint_path.parent / "checkpoint" / "ray_encoder_best.pth",
+            ]
+            if checkpoint_path.name == "ray_encoder_latest.pth":
+                candidates.insert(0, checkpoint_path.parent / "checkpoint" / "ray_encoder_best.pth")
+            replacement = next((path for path in candidates if path.exists()), None)
+            if replacement is None:
+                raise FileNotFoundError(f"RayEncoder checkpoint does not exist: {checkpoint_path}")
+            if self.rank == 0:
+                print(f"Using RayEncoder checkpoint from migrated path: {replacement}")
+            checkpoint_path = replacement
         checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
         source_state = self._extract_ray_encoder_state_dict(checkpoint)
         target = unwrap_model(self.models["light_encoder"])
@@ -137,30 +180,56 @@ class CPLightSiTTrainer(Trainer):
     def _apply_trainable_policy(self) -> None:
         model = unwrap_model(self.models["model"])
         light_encoder = unwrap_model(self.models["light_encoder"])
-        light_transfer = unwrap_model(self.models["light_transfer_transformer"])
-        tokenizer = unwrap_model(self.models["tokenizer"])
 
         if self.stage == "ray_pretrain":
             set_requires_grad(model, False)
             set_requires_grad(light_encoder, True)
-            set_requires_grad(light_transfer, False)
-            set_requires_grad(tokenizer, False)
+            if "light_transfer_transformer" in self.models:
+                set_requires_grad(unwrap_model(self.models["light_transfer_transformer"]), False)
+            if "tokenizer" in self.models:
+                set_requires_grad(unwrap_model(self.models["tokenizer"]), False)
             return
         if self.stage != "cplightsit_finetune":
             raise ValueError(f"Unsupported stage='{self.stage}'. Expected 'cplightsit_finetune' or 'ray_pretrain'.")
 
+        light_transfer = unwrap_model(self.models["light_transfer_transformer"])
+        tokenizer = unwrap_model(self.models["tokenizer"])
         if bool(self.config.get("freeze_backbone", True)):
             set_requires_grad(model, False)
             if bool(self.config.get("train_condition_adapters_only", True)):
-                for name in ["light_mlp", "dense_proj", "source_proj"]:
+                for name in self._CONDITION_ADAPTER_MODULES:
                     module = getattr(model, name, None)
                     if isinstance(module, nn.Module):
                         set_requires_grad(module, True)
+            self._enable_diffusion_backbone_finetuning(model)
 
         freeze_ray = bool(self.config.get("freeze_ray_encoder", self.config.get("freeze_light_encoder", True)))
         set_requires_grad(light_encoder, not freeze_ray)
         set_requires_grad(light_transfer, bool(self.config.get("train_light_transfer_transformer", True)))
         set_requires_grad(tokenizer, not bool(self.config.get("freeze_tokenizer", True)))
+
+    def _enable_if_present(self, model: nn.Module, module_name: str) -> None:
+        module = getattr(model, module_name, None)
+        if isinstance(module, nn.Module):
+            set_requires_grad(module, True)
+
+    def _enable_diffusion_backbone_finetuning(self, model: nn.Module) -> None:
+        if not bool(self.config.get("train_diffusion_backbone", False)):
+            return
+        if bool(self.config.get("train_diffusion_input_embedder", True)):
+            self._enable_if_present(model, "x_embedder")
+        if bool(self.config.get("train_diffusion_time_embedder", False)):
+            self._enable_if_present(model, "t_embedder")
+        if bool(self.config.get("train_diffusion_label_embedder", False)):
+            self._enable_if_present(model, "y_embedder")
+        if bool(self.config.get("train_diffusion_final_layer", True)):
+            self._enable_if_present(model, "final_layer")
+
+        blocks = getattr(model, "blocks", None)
+        last_n = max(int(self.config.get("train_diffusion_last_n_blocks", 0)), 0)
+        if isinstance(blocks, nn.ModuleList) and last_n > 0:
+            for block in blocks[-min(last_n, len(blocks)) :]:
+                set_requires_grad(block, True)
 
     def _module_trainable_count(self, name: str) -> int:
         return count_trainable_parameters(unwrap_model(self.models[name]))
@@ -170,9 +239,19 @@ class CPLightSiTTrainer(Trainer):
             return
         model = unwrap_model(self.models["model"])
         print(f"CP-LightSiT parameters: total={count_parameters(model):,}, trainable={count_trainable_parameters(model):,}")
+        if self.stage == "cplightsit_finetune" and bool(self.config.get("train_diffusion_backbone", False)):
+            print(
+                "Diffusion finetuning: "
+                f"last_blocks={int(self.config.get('train_diffusion_last_n_blocks', 0))}, "
+                f"input_embedder={bool(self.config.get('train_diffusion_input_embedder', True))}, "
+                f"final_layer={bool(self.config.get('train_diffusion_final_layer', True))}, "
+                f"backbone_lr={float(self.config.get('backbone_lr', 0.0)):.2e}"
+            )
         print(f"RayEncoder trainable parameters: {self._module_trainable_count('light_encoder'):,}")
-        print(f"LightTransferTransformer trainable parameters: {self._module_trainable_count('light_transfer_transformer'):,}")
-        print(f"Tokenizer trainable parameters: {self._module_trainable_count('tokenizer'):,}")
+        if "light_transfer_transformer" in self.models:
+            print(f"LightTransferTransformer trainable parameters: {self._module_trainable_count('light_transfer_transformer'):,}")
+        if "tokenizer" in self.models:
+            print(f"Tokenizer trainable parameters: {self._module_trainable_count('tokenizer'):,}")
 
     def _named_trainable_params(self, module: nn.Module) -> list[nn.Parameter]:
         return [param for param in module.parameters() if param.requires_grad]
@@ -180,15 +259,19 @@ class CPLightSiTTrainer(Trainer):
     def _optimizer_param_groups(self) -> list[dict[str, object]]:
         groups: list[dict[str, object]] = []
         base_lr = float(self.config.get("lr", self.config.optimizer.adamw.get("lr", 1e-4)))
+        weight_decay = float(self.config.get("weight_decay", self.config.optimizer.adamw.get("weight_decay", 0.01)))
+        if self.stage == "ray_pretrain":
+            params = self._named_trainable_params(unwrap_model(self.models["light_encoder"]))
+            return [{"params": params, "lr": base_lr, "weight_decay": weight_decay}] if params else []
+
         backbone_lr = float(self.config.get("backbone_lr", base_lr))
         adapter_lr = float(self.config.get("adapter_lr", base_lr))
         light_transfer_lr = float(self.config.get("light_transfer_lr", base_lr))
-        weight_decay = float(self.config.get("weight_decay", self.config.optimizer.adamw.get("weight_decay", 0.01)))
 
         model = unwrap_model(self.models["model"])
         adapter_ids: set[int] = set()
         adapter_params: list[nn.Parameter] = []
-        for name in ["light_mlp", "dense_proj", "source_proj"]:
+        for name in self._CONDITION_ADAPTER_MODULES:
             module = getattr(model, name, None)
             if isinstance(module, nn.Module):
                 for param in module.parameters():
@@ -207,16 +290,74 @@ class CPLightSiTTrainer(Trainer):
             groups.append({"params": light_transfer_params, "lr": light_transfer_lr, "weight_decay": weight_decay})
 
         for name in ["light_encoder", "tokenizer"]:
+            if name not in self.models:
+                continue
             params = self._named_trainable_params(unwrap_model(self.models[name]))
             if params:
                 groups.append({"params": params, "lr": base_lr, "weight_decay": weight_decay})
         return groups
 
+    def _optimizer_step(self, total: torch.Tensor) -> None:
+        if self.grad_scaler.is_enabled():
+            self.grad_scaler.scale(total).backward()
+            if self.clip_grad_norm > 0:
+                self.grad_scaler.unscale_(self.optimizer)
+                params = [param for model in self.models.values() for param in model.parameters() if param.requires_grad]
+                torch.nn.utils.clip_grad_norm_(params, self.clip_grad_norm)
+            self.grad_scaler.step(self.optimizer)
+            self.grad_scaler.update()
+            return
+        total.backward()
+        if self.clip_grad_norm > 0:
+            params = [param for model in self.models.values() for param in model.parameters() if param.requires_grad]
+            torch.nn.utils.clip_grad_norm_(params, self.clip_grad_norm)
+        self.optimizer.step()
+
+    def _record_stream(self, value: object, stream: torch.cuda.Stream) -> None:
+        if torch.is_tensor(value) and value.device.type == "cuda":
+            value.record_stream(stream)
+        elif isinstance(value, dict):
+            for item in value.values():
+                self._record_stream(item, stream)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                self._record_stream(item, stream)
+
+    def _prefetched_batches(self, dataloader: Iterable[dict[str, torch.Tensor]]) -> Iterable[dict[str, torch.Tensor]]:
+        if self.device.type != "cuda" or not bool(self.config.get("cuda_prefetch", True)):
+            yield from dataloader
+            return
+
+        iterator = iter(dataloader)
+        stream = torch.cuda.Stream(device=self.device)
+        next_batch: dict[str, torch.Tensor] | None = None
+
+        def preload() -> None:
+            nonlocal next_batch
+            try:
+                raw_batch = next(iterator)
+            except StopIteration:
+                next_batch = None
+                return
+            with torch.cuda.stream(stream):
+                next_batch = self._move_tensor_batch(raw_batch)  # type: ignore[arg-type]
+
+        preload()
+        while next_batch is not None:
+            torch.cuda.current_stream(self.device).wait_stream(stream)
+            batch = next_batch
+            self._record_stream(batch, torch.cuda.current_stream(self.device))
+            preload()
+            yield batch
+
     def _move_tensor_batch(self, batch: dict[str, object]) -> dict[str, object]:
         output: dict[str, object] = {}
         for key, value in batch.items():
             if torch.is_tensor(value):
-                output[key] = value.to(self.device, non_blocking=True)
+                moved = value.to(self.device, non_blocking=True)
+                if bool(self.config.get("channels_last", True)) and moved.ndim == 4 and moved.is_floating_point():
+                    moved = moved.contiguous(memory_format=torch.channels_last)
+                output[key] = moved
             else:
                 output[key] = value
         return output
@@ -224,7 +365,9 @@ class CPLightSiTTrainer(Trainer):
     def _encode_image(self, image: torch.Tensor) -> torch.Tensor:
         if bool(self.config.get("freeze_tokenizer", True)):
             with torch.no_grad():
+                assert self.tokenizer is not None
                 return self.tokenizer.encode(image).detach()
+        assert self.tokenizer is not None
         return self.tokenizer.encode(image)
 
     def _run_light_encoder(self, image: torch.Tensor) -> dict[str, torch.Tensor]:
@@ -241,34 +384,157 @@ class CPLightSiTTrainer(Trainer):
         target = F.normalize(target_ray.float(), dim=1, eps=1e-6)
         return torch.nan_to_num((pred * target).sum(dim=1).mean())
 
+    def _ray_cosine_loss(self, pred_ray: torch.Tensor, target_ray: torch.Tensor) -> torch.Tensor:
+        return torch.nan_to_num(1.0 - self._cosine_metric(pred_ray, target_ray))
+
+    def _direction_classes_from_angles(self, angles: torch.Tensor) -> torch.Tensor:
+        direction_angles = torch.tensor(
+            [DIRECTION_TO_ANGLE[name] for name in ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]],
+            dtype=torch.float32,
+            device=angles.device,
+        )
+        delta = (angles.float().view(-1, 1) - direction_angles.view(1, -1) + 180.0) % 360.0 - 180.0
+        return delta.abs().argmin(dim=1)
+
+    def _direction_ce_loss(self, pred_ray: torch.Tensor, target_angle: torch.Tensor) -> torch.Tensor:
+        direction_angles = torch.tensor(
+            [DIRECTION_TO_ANGLE[name] for name in ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]],
+            dtype=torch.float32,
+            device=pred_ray.device,
+        )
+        radians = torch.deg2rad(direction_angles)
+        canonical = torch.stack([torch.cos(radians), torch.sin(radians)], dim=1)
+        pred_dir = F.normalize(pred_ray[:, :2].float(), dim=1, eps=1e-6)
+        temperature = max(float(self.config.get("ray_direction_ce_temperature", 0.07)), 1e-4)
+        logits = pred_dir @ canonical.T / temperature
+        target = self._direction_classes_from_angles(target_angle)
+        return torch.nan_to_num(F.cross_entropy(logits.float(), target))
+
+    def _ray_angle_accuracy(self, pred_ray: torch.Tensor, target_angle: torch.Tensor) -> torch.Tensor:
+        pred = F.normalize(pred_ray[:, :2].float(), dim=1, eps=1e-6)
+        pred_angle = torch.rad2deg(torch.atan2(pred[:, 1], pred[:, 0])) % 360.0
+        pred_class = self._direction_classes_from_angles(pred_angle)
+        target_class = self._direction_classes_from_angles(target_angle)
+        return (pred_class == target_class).float().mean()
+
     def _diffusion_train_kwargs(self) -> dict[str, float]:
         return dict(OmegaConf.to_container(self.config.diffusion.train, resolve=True))
 
     def _ray_pretrain_loss(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         batch = self._move_tensor_batch(batch)  # type: ignore[assignment]
         source_image = batch["source_image"]
+        target_image = batch.get("target_image")
         source_light = batch["source_light"]
+        target_light = batch.get("target_light")
         source_ray = batch.get("source_ray")
+        target_ray = batch.get("target_ray")
+        source_angle = batch.get("source_angle")
+        target_angle = batch.get("target_angle")
+        delta_angle = batch.get("delta_angle")
+        depth = batch.get("depth")
+        depth_valid = batch.get("depth_valid")
         assert torch.is_tensor(source_image)
         assert torch.is_tensor(source_light)
         source_ray_tensor = source_ray if torch.is_tensor(source_ray) else light_to_ray(source_light)
 
         self.optimizer.zero_grad(set_to_none=True)
-        pred = self.light_encoder(source_image)
-        ray_loss = 1.0 - self._cosine_metric(pred["ray"], source_ray_tensor)
-        temp_loss = F.l1_loss(pred["temperature"].float(), source_light[:, 2:3].float())
-        total = torch.nan_to_num(ray_loss + 0.1 * temp_loss)
-        total.backward()
-        if self.clip_grad_norm > 0:
-            params = [param for model in self.models.values() for param in model.parameters() if param.requires_grad]
-            torch.nn.utils.clip_grad_norm_(params, self.clip_grad_norm)
-        self.optimizer.step()
+        with self._autocast():
+            source_pred = self.light_encoder(source_image)
+            source_ray_loss = self._ray_cosine_loss(source_pred["ray"], source_ray_tensor)
+            source_temp_loss = F.l1_loss(source_pred["temperature"].float(), source_light[:, 2:3].float())
+            direction_ce = (
+                self._direction_ce_loss(source_pred["ray"], source_angle)
+                if torch.is_tensor(source_angle)
+                else self._zero_like(source_ray_loss)
+            )
+            reference_loss = self._zero_like(source_ray_loss)
+            target_ray_loss = self._zero_like(source_ray_loss)
+            target_temp_loss = self._zero_like(source_ray_loss)
+            physics_loss = self._zero_like(source_ray_loss)
+            target_cosine = self._zero_like(source_ray_loss)
+            rotated_target_cosine = self._zero_like(source_ray_loss)
+            source_acc = (
+                self._ray_angle_accuracy(source_pred["ray"].detach(), source_angle)
+                if torch.is_tensor(source_angle)
+                else self._zero_like(source_ray_loss)
+            )
+            target_acc = self._zero_like(source_ray_loss)
+
+            has_reference = (
+                torch.is_tensor(target_image)
+                and torch.is_tensor(target_light)
+                and torch.is_tensor(target_ray)
+                and torch.is_tensor(target_angle)
+                and torch.is_tensor(delta_angle)
+            )
+            if has_reference:
+                target_ray_tensor = target_ray
+                target_pred = self.light_encoder(target_image)
+                target_ray_loss = self._ray_cosine_loss(target_pred["ray"], target_ray_tensor)
+                target_temp_loss = F.l1_loss(target_pred["temperature"].float(), target_light[:, 2:3].float())
+                direction_ce = 0.5 * (
+                    direction_ce + self._direction_ce_loss(target_pred["ray"], target_angle)
+                )
+                rotated_source_ray = rotate_ray_z(source_pred["ray"], delta_angle)
+                rotated_target_ray = rotate_ray_z(target_pred["ray"], -delta_angle)
+                reference_loss = 0.5 * (
+                    self._ray_cosine_loss(rotated_source_ray, target_pred["ray"].detach())
+                    + self._ray_cosine_loss(rotated_target_ray, source_pred["ray"].detach())
+                )
+                target_cosine = self._cosine_metric(target_pred["ray"].detach(), target_ray_tensor)
+                rotated_target_cosine = self._cosine_metric(rotated_source_ray.detach(), target_ray_tensor)
+                target_acc = self._ray_angle_accuracy(target_pred["ray"].detach(), target_angle)
+
+                if float(self.config.get("lambda_ray_physics", 0.0)) > 0.0:
+                    assert self.physics_light_transfer is not None
+                    source_light_pred = ray_to_light(source_pred["ray"], source_pred["temperature"])
+                    target_light_pred = ray_to_light(target_pred["ray"], target_pred["temperature"])
+                    physics = self.physics_light_transfer(
+                        source_image,
+                        source_light_pred,
+                        target_light_pred,
+                        depth if torch.is_tensor(depth) else None,
+                        source_ray=source_pred["ray"],
+                        target_ray=target_pred["ray"],
+                        depth_valid=depth_valid if torch.is_tensor(depth_valid) else None,
+                    )
+                    q_star = compute_log_luminance_transfer(
+                        source_image,
+                        target_image,
+                        q_clip=float(self.config.get("ray_physics_q_clip", self.config.get("q_clip", 2.0))),
+                    )
+                    physics_loss = F.smooth_l1_loss(
+                        physics["delta_l_phys"].float(),
+                        q_star.float(),
+                        beta=float(self.config.get("ray_physics_smooth_l1_beta", 0.1)),
+                    )
+
+            ray_loss = 0.5 * (source_ray_loss + target_ray_loss) if has_reference else source_ray_loss
+            temp_loss = 0.5 * (source_temp_loss + target_temp_loss) if has_reference else source_temp_loss
+            total = (
+                float(self.config.get("lambda_ray_direct", 1.0)) * ray_loss
+                + float(self.config.get("lambda_ray_direction_ce", 0.25)) * direction_ce
+                + float(self.config.get("lambda_ray_reference", 0.5)) * reference_loss
+                + float(self.config.get("lambda_ray_physics", 0.1)) * physics_loss
+                + float(self.config.get("lambda_ray_temperature", 0.05)) * temp_loss
+            )
+            total = torch.nan_to_num(total)
+        self._optimizer_step(total)
         return {
             "Train/total": total.detach(),
             "Train/ray_pretrain/loss": total.detach(),
             "Train/ray_pretrain/ray": torch.nan_to_num(ray_loss.detach()),
+            "Train/ray_pretrain/source_ray": torch.nan_to_num(source_ray_loss.detach()),
+            "Train/ray_pretrain/target_ray": torch.nan_to_num(target_ray_loss.detach()),
+            "Train/ray_pretrain/direction_ce": torch.nan_to_num(direction_ce.detach()),
+            "Train/ray_pretrain/reference": torch.nan_to_num(reference_loss.detach()),
+            "Train/ray_pretrain/physics": torch.nan_to_num(physics_loss.detach()),
             "Train/ray_pretrain/temp": torch.nan_to_num(temp_loss.detach()),
-            "Train/source_ray/cosine": self._cosine_metric(pred["ray"].detach(), source_ray_tensor),
+            "Train/source_ray/cosine": self._cosine_metric(source_pred["ray"].detach(), source_ray_tensor),
+            "Train/target_ray/cosine": torch.nan_to_num(target_cosine.detach()),
+            "Train/rotated_target_ray/cosine": torch.nan_to_num(rotated_target_cosine.detach()),
+            "Train/source_direction/acc": torch.nan_to_num(source_acc.detach()),
+            "Train/target_direction/acc": torch.nan_to_num(target_acc.detach()),
         }
 
     def train_single_step(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
@@ -301,60 +567,59 @@ class CPLightSiTTrainer(Trainer):
         depth_valid_tensor = depth_valid if torch.is_tensor(depth_valid) else None
 
         self.optimizer.zero_grad(set_to_none=True)
-        target_tokens = self._encode_image(target_image)
-        source_tokens = self._encode_image(source_image)
-        light_pred = self._run_light_encoder(source_image)
-        source_ray_pred = light_pred["ray"]
-        source_light_pred = light_pred["light"]
+        with self._autocast():
+            target_tokens = self._encode_image(target_image)
+            source_tokens = self._encode_image(source_image)
+            light_pred = self._run_light_encoder(source_image)
+            source_ray_pred = light_pred["ray"]
+            source_light_pred = light_pred["light"]
 
-        use_gt_prob = float(self.config.get("use_gt_source_light_prob", 0.5))
-        use_gt = (torch.rand(source_light.shape[0], 1, device=self.device) < use_gt_prob).to(dtype=source_light.dtype)
-        source_ray_used = F.normalize(use_gt * source_ray_tensor + (1.0 - use_gt) * source_ray_pred, dim=1, eps=1e-6)
-        source_temperature_used = use_gt * source_light[:, 2:3] + (1.0 - use_gt) * source_light_pred[:, 2:3]
-        source_light_used = ray_to_light(source_ray_used, source_temperature_used)
-        target_ray_rotated = rotate_ray_z(source_ray_used, delta_angle_tensor)
-        target_light_rotated = ray_to_light(target_ray_rotated, target_light[:, 2:3])
+            use_gt_prob = float(self.config.get("use_gt_source_light_prob", 0.5))
+            use_gt = (torch.rand(source_light.shape[0], 1, device=self.device) < use_gt_prob).to(dtype=source_light.dtype)
+            source_ray_used = F.normalize(use_gt * source_ray_tensor + (1.0 - use_gt) * source_ray_pred, dim=1, eps=1e-6)
+            source_temperature_used = use_gt * source_light[:, 2:3] + (1.0 - use_gt) * source_light_pred[:, 2:3]
+            source_light_used = ray_to_light(source_ray_used, source_temperature_used)
+            target_ray_rotated = rotate_ray_z(source_ray_used, delta_angle_tensor)
+            target_light_rotated = ray_to_light(target_ray_rotated, target_light[:, 2:3])
 
-        physics = self.physics_light_transfer(
-            source_image,
-            source_light_used,
-            target_light_rotated,
-            depth_tensor,
-            source_ray=source_ray_used,
-            target_ray=target_ray_rotated,
-            depth_valid=depth_valid_tensor,
-        )
-        transfer = self.light_transfer_transformer(source_image, source_light_used, target_light_rotated, physics)
-        dense_cond = transfer["dense_cond"].detach() if bool(self.config.get("detach_dense_cond_from_flow", False)) else transfer["dense_cond"]
-        light_cond = torch.cat([source_light_used, target_light_rotated, target_light_rotated - source_light_used], dim=1)
-        cond = {"y": y, "light_cond": light_cond, "dense_cond": dense_cond, "source_tokens": source_tokens}
-        flow_loss_dict = self.diffusion(
-            x=target_tokens,
-            cond=cond,
-            mask=mask,
-            losses=self.losses,
-            description="Train",
-            return_outputs=True,
-            **self._diffusion_train_kwargs(),
-        )
-        transfer_loss_dict = compute_dense_transfer_loss(
-            transfer["delta_l"],
-            source_image,
-            target_image,
-            q_clip=float(self.config.get("q_clip", 2.0)),
-            beta=float(self.config.get("transfer_smooth_l1_beta", 0.1)),
-        )
-        flow_loss = flow_loss_dict["Train/loss"]
-        transfer_loss = transfer_loss_dict["Train/light_transfer/loss"]
-        total = float(self.config.lambda_flow) * flow_loss
-        if float(self.config.lambda_transfer) > 0:
-            total = total + float(self.config.lambda_transfer) * transfer_loss
-        total = torch.nan_to_num(total)
-        total.backward()
-        if self.clip_grad_norm > 0:
-            params = [param for model in self.models.values() for param in model.parameters() if param.requires_grad]
-            torch.nn.utils.clip_grad_norm_(params, self.clip_grad_norm)
-        self.optimizer.step()
+            assert self.physics_light_transfer is not None
+            assert self.light_transfer_transformer is not None
+            physics = self.physics_light_transfer(
+                source_image,
+                source_light_used,
+                target_light_rotated,
+                depth_tensor,
+                source_ray=source_ray_used,
+                target_ray=target_ray_rotated,
+                depth_valid=depth_valid_tensor,
+            )
+            transfer = self.light_transfer_transformer(source_image, source_light_used, target_light_rotated, physics)
+            dense_cond = transfer["dense_cond"].detach() if bool(self.config.get("detach_dense_cond_from_flow", False)) else transfer["dense_cond"]
+            light_cond = torch.cat([source_light_used, target_light_rotated, target_light_rotated - source_light_used], dim=1)
+            cond = {"y": y, "light_cond": light_cond, "dense_cond": dense_cond, "source_tokens": source_tokens}
+            flow_loss_dict = self.diffusion(
+                x=target_tokens,
+                cond=cond,
+                mask=mask,
+                losses=self.losses,
+                description="Train",
+                return_outputs=True,
+                **self._diffusion_train_kwargs(),
+            )
+            transfer_loss_dict = compute_dense_transfer_loss(
+                transfer["delta_l"],
+                source_image,
+                target_image,
+                q_clip=float(self.config.get("q_clip", 2.0)),
+                beta=float(self.config.get("transfer_smooth_l1_beta", 0.1)),
+            )
+            flow_loss = flow_loss_dict["Train/loss"]
+            transfer_loss = transfer_loss_dict["Train/light_transfer/loss"]
+            total = float(self.config.lambda_flow) * flow_loss
+            if float(self.config.lambda_transfer) > 0:
+                total = total + float(self.config.lambda_transfer) * transfer_loss
+            total = torch.nan_to_num(total)
+        self._optimizer_step(total)
 
         zero = self._zero_like(total.detach())
         all_losses: dict[str, torch.Tensor] = {
@@ -381,20 +646,41 @@ class CPLightSiTTrainer(Trainer):
         all_losses.update({key: value.detach() for key, value in flow_loss_dict.items() if torch.is_tensor(value) and value.ndim == 0})
         return all_losses
 
-    def save_checkpoint(self, epoch: int, name: str | None = None) -> None:
-        super().save_checkpoint(epoch, name=name)
-        if self.rank != 0 or self.stage != "ray_pretrain":
-            return
-        checkpoint = {
-            "light_encoder": unwrap_model(self.models["light_encoder"]).state_dict(),
-            "epoch": epoch,
-            "config": OmegaConf.to_container(self.config, resolve=True),
-        }
-        torch.save(checkpoint, self.result_dir / f"ray_encoder_epoch_{epoch:04d}.pth")
-        torch.save(checkpoint, self.result_dir / "ray_encoder_latest.pth")
-        pointer = Path(str(self.config.get("result_root", "checkpoint"))) / "latest_RayEncoder.txt"
-        pointer.parent.mkdir(parents=True, exist_ok=True)
-        pointer.write_text(str(self.result_dir), encoding="utf-8")
+    def save_checkpoint(self, epoch: int, name: str | None = None, score: float | None = None) -> bool:
+        if self.stage == "ray_pretrain":
+            if self.rank != 0:
+                return False
+            is_best = score is not None and score < self.best_checkpoint_score
+            if is_best:
+                self.best_checkpoint_score = float(score)
+            checkpoint = {
+                "light_encoder": unwrap_model(self.models["light_encoder"]).state_dict(),
+                "epoch": epoch,
+                "score": score,
+                "best_score": self.best_checkpoint_score,
+                "config": OmegaConf.to_container(self.config, resolve=True),
+            }
+            epoch_path = self.checkpoint_dir / f"ray_encoder_epoch_{epoch:04d}.pth"
+            torch.save(checkpoint, epoch_path)
+            if is_best:
+                best_path = self.checkpoint_dir / "ray_encoder_best.pth"
+                best_path.unlink(missing_ok=True)
+                try:
+                    os.link(epoch_path, best_path)
+                except OSError:
+                    shutil.copy2(epoch_path, best_path)
+            keep = int(self.config.get("keep_last_checkpoints", 10))
+            if keep > 0:
+                checkpoints = sorted(self.checkpoint_dir.glob("ray_encoder_epoch_*.pth"))
+                for old_path in checkpoints[:-keep]:
+                    old_path.unlink(missing_ok=True)
+            pointer = Path(str(self.config.get("result_root", "checkpoint"))) / "latest_RayEncoder.txt"
+            pointer.parent.mkdir(parents=True, exist_ok=True)
+            pointer.write_text(str(self.result_dir), encoding="utf-8")
+            return is_best
+
+        is_best = super().save_checkpoint(epoch, name=name, score=score)
+        return is_best
 
     def train_process(self) -> None:
         epochs = int(self.config.epochs)
@@ -404,10 +690,20 @@ class CPLightSiTTrainer(Trainer):
             sampler = getattr(self.train_dataloader, "sampler", None)
             if hasattr(sampler, "set_epoch"):
                 sampler.set_epoch(epoch)
-            iterator: Iterable[dict[str, torch.Tensor]] = tqdm(self.train_dataloader, desc=f"Epoch {epoch}", disable=self.rank != 0)
-            for batch in iterator:
+            iterator: Iterable[dict[str, torch.Tensor]] = tqdm(
+                self.train_dataloader,
+                desc=f"Epoch {epoch}",
+                disable=self.rank != 0,
+                file=unwrap_terminal_stream(sys.stderr),
+                dynamic_ncols=True,
+            )
+            epoch_total = 0.0
+            epoch_steps = 0
+            for batch in self._prefetched_batches(iterator):
                 losses = self.train_single_step(batch)
                 self.global_step += 1
+                epoch_total += float(losses["Train/total"].detach().cpu())
+                epoch_steps += 1
                 if self.rank == 0 and hasattr(iterator, "set_postfix"):
                     iterator.set_postfix({"loss": f"{float(losses['Train/total']):.4f}"})  # type: ignore[attr-defined]
                 if self.global_step % int(self.config.log_every) == 0:
@@ -415,7 +711,11 @@ class CPLightSiTTrainer(Trainer):
                 if bool(self.config.get("debug_one_batch", False)):
                     self.log_wandb(losses, step=self.global_step)
                     break
+            epoch_score = epoch_total / max(epoch_steps, 1)
             if (epoch + 1) % int(self.config.save_every) == 0:
-                self.save_checkpoint(epoch)
+                is_best = self.save_checkpoint(epoch, score=epoch_score)
+                if self.rank == 0:
+                    marker = " best" if is_best else ""
+                    print(f"Epoch {epoch}: mean Train/total={epoch_score:.6f}{marker}")
             if bool(self.config.get("debug_one_batch", False)):
                 break

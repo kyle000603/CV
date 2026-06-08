@@ -7,18 +7,22 @@ from typing import TextIO
 
 
 class TeeStream:
-    def __init__(self, stream: TextIO, log_file: TextIO) -> None:
+    def __init__(self, stream: TextIO, log_file: TextIO, log_carriage_returns: bool = False) -> None:
         self.stream = stream
         self.log_file = log_file
         self.encoding = getattr(stream, "encoding", "utf-8")
         self.errors = getattr(stream, "errors", "replace")
+        self.log_carriage_returns = log_carriage_returns
         self._cplightsit_tee = True
         self._cplightsit_log_path = str(Path(log_file.name))
 
     def write(self, data: str) -> int:
         written = self.stream.write(data)
         if not self.log_file.closed:
-            self.log_file.write(data)
+            if self.log_carriage_returns or "\r" not in data:
+                self.log_file.write(data)
+            elif "\n" in data:
+                self.log_file.write("\n")
         return written
 
     def flush(self) -> None:
@@ -34,6 +38,13 @@ class TeeStream:
 
     def __getattr__(self, name: str) -> object:
         return getattr(self.stream, name)
+
+
+def unwrap_terminal_stream(stream: TextIO) -> TextIO:
+    current = stream
+    while getattr(current, "_cplightsit_tee", False):
+        current = getattr(current, "stream")  # type: ignore[assignment]
+    return current
 
 
 def _iter_stream_handlers() -> list[logging.StreamHandler]:

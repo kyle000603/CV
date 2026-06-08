@@ -3,3 +3,4 @@
 /pretrained
 /checkpoint
 /outputs
+*.pyc

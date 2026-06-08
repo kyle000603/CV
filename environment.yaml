@@ -46,6 +46,7 @@ dependencies:
       - click==8.4.1
       - datasets==5.0.0
       - dill==0.4.1
+      - diffusers
       - filelock==3.29.1
       - frozenlist==1.8.0
       - fsspec==2026.4.0
@@ -104,6 +105,9 @@ dependencies:
       - torch==2.7.1
       - torchaudio==2.7.1
       - torchvision==0.22.1
+      - transformers
+      - accelerate
+      - safetensors
       - tqdm==4.68.1
       - triton==3.3.1
       - typer==0.25.1

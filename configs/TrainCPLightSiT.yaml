@@ -16,9 +16,15 @@ loss_mode: minimal
 
 image_size: 256
 mask_size: 16
-num_workers: 4
-batch_size: 16
+num_workers: 24
+batch_size: 128
 global_seed: 0
+cudnn_benchmark: true
+float32_matmul_precision: high
+amp_enabled: true
+amp_dtype: bfloat16
+cuda_prefetch: true
+channels_last: true
 
 epochs: 100
 result_root: checkpoint
@@ -33,11 +39,12 @@ ddp_find_unused_parameters: false
 silent_nonzero_rank_wait: true
 log_every: 100
 save_every: 1
-keep_last_checkpoints: 5
+keep_last_checkpoints: 10
+checkpoint_subdir: checkpoint
 checkpoint: null
 ray_encoder_checkpoint: null
 
-feature_dim: 392
+feature_dim: 16
 token_grid_size: 16
 token_count: 256
 
@@ -48,6 +55,12 @@ freeze_light_encoder: true
 freeze_tokenizer: true
 train_condition_adapters_only: true
 train_light_transfer_transformer: true
+train_diffusion_backbone: true
+train_diffusion_input_embedder: true
+train_diffusion_time_embedder: false
+train_diffusion_label_embedder: false
+train_diffusion_last_n_blocks: 4
+train_diffusion_final_layer: true
 allow_freeze_without_pretrain: false
 detach_dense_cond_from_flow: false
 enable_image_space_losses: false
@@ -55,12 +68,12 @@ decode_loss_every: 0
 debug_one_batch: false
 q_clip: 2.0
 transfer_smooth_l1_beta: 0.1
-lr: 0.0001
-backbone_lr: 0.0
-adapter_lr: 0.0001
-light_transfer_lr: 0.0001
+lr: 0.00003
+backbone_lr: 0.00001
+adapter_lr: 0.00003
+light_transfer_lr: 0.00003
 weight_decay: 0.01
-grad_clip_norm: 1.0
+grad_clip_norm: 0.5
 
 lambda_flow: 1.0
 lambda_transfer: 0.1
@@ -68,8 +81,21 @@ lambda_transfer: 0.1
 light_encoder:
   _target_: models.modules.ray_encoder.RayEncoder
   light_dim: 3
-  hidden_dim: 256
+  hidden_dim: 512
   extended: false
+
+tokenizer:
+  _target_: models.modules.vae_tokenizer.DiffusersAutoencoderTokenizer
+  pretrained_model_name_or_path: ${assets.vae_pretrained.path}
+  image_size: ${image_size}
+  latent_channels: 4
+  downsample_factor: 8
+  patch_size: 2
+  scaling_factor: 0.18215
+  cache_dir: data/hf_cache
+  local_files_only: true
+  sample_posterior: false
+  torch_dtype: bfloat16
 
 physics_light_transfer:
   _target_: models.modules.physics_light_transfer.PhysicsLightTransfer
@@ -102,6 +128,13 @@ assets:
     min_images: 100
     max_items: null
     force: false
+    disable_xet: true
+  vae_pretrained:
+    enabled: true
+    repo_id: stabilityai/sd-vae-ft-mse
+    path: pretrained/vae/sd-vae-ft-mse
+    cache_dir: data/hf_cache
+    optional: false
     disable_xet: true
   vidit:
     enabled: false

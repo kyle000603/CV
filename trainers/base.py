@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -11,7 +12,7 @@ from hydra.utils import instantiate
 from omegaconf import DictConfig, OmegaConf
 from torch.nn.parallel import DistributedDataParallel
 
-from trainers.assets import ensure_hf_vidit_assets, ensure_vidit_assets, load_pretrained_backbone
+from trainers.assets import ensure_hf_vidit_assets, ensure_vae_assets, ensure_vidit_assets, load_pretrained_backbone
 from trainers.file_logging import setup_output_log
 from trainers.utils import ensure_dir, next_numbered_run_dir, scalar_dict_to_float, state_dict_for_save, unwrap_model
 
@@ -26,9 +27,12 @@ class Trainer:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.wandb_run: Any = None
         self.pretrained_loaded = False
+        self.best_checkpoint_score = float("inf")
+        self.setup_torch_performance()
         self.setup_ddp()
         try:
             self.setup_result_dir()
+            self.setup_checkpoint_dir()
             self.setup_file_logging()
             self.setup_assets()
             self.setup_datasets()
@@ -43,6 +47,13 @@ class Trainer:
         except Exception:
             self.cleanup()
             raise
+
+    def setup_torch_performance(self) -> None:
+        if torch.cuda.is_available():
+            torch.backends.cudnn.benchmark = bool(self.config.get("cudnn_benchmark", True))
+        precision = str(self.config.get("float32_matmul_precision", "")).strip()
+        if precision:
+            torch.set_float32_matmul_precision(precision)
 
     def setup_ddp(self) -> None:
         if "WORLD_SIZE" in os.environ and int(os.environ["WORLD_SIZE"]) > 1:
@@ -72,7 +83,8 @@ class Trainer:
 
         checkpoint_path = self.config.get("checkpoint")
         if checkpoint_path is not None:
-            self.result_dir = ensure_dir(Path(str(checkpoint_path)).parent)
+            checkpoint_parent = Path(str(checkpoint_path)).parent
+            self.result_dir = ensure_dir(checkpoint_parent.parent if checkpoint_parent.name == "checkpoint" else checkpoint_parent)
             if dist.is_available() and dist.is_initialized():
                 self.barrier()
             return
@@ -97,6 +109,37 @@ class Trainer:
         if dist.is_available() and dist.is_initialized():
             self.barrier()
 
+    def setup_checkpoint_dir(self) -> None:
+        subdir = str(self.config.get("checkpoint_subdir", "checkpoint"))
+        self.checkpoint_dir = ensure_dir(self.result_dir / subdir)
+        if self.rank == 0:
+            self._migrate_legacy_checkpoints()
+        if dist.is_available() and dist.is_initialized():
+            self.barrier()
+
+    def _move_legacy_checkpoint(self, source: Path, target_name: str | None = None) -> None:
+        if not source.exists() or source.parent == self.checkpoint_dir:
+            return
+        target = self.checkpoint_dir / (target_name or source.name)
+        if target.exists():
+            source.unlink(missing_ok=True)
+            return
+        target.parent.mkdir(parents=True, exist_ok=True)
+        source.replace(target)
+
+    def _migrate_legacy_checkpoints(self) -> None:
+        legacy_single_files = {
+            "latest.pth": "best.pth",
+            "best.pth": "best.pth",
+            "ray_encoder_latest.pth": "ray_encoder_best.pth",
+            "ray_encoder_best.pth": "ray_encoder_best.pth",
+        }
+        for source_name, target_name in legacy_single_files.items():
+            self._move_legacy_checkpoint(self.result_dir / source_name, target_name=target_name)
+        for pattern in ["epoch_*.pth", "ray_encoder_epoch_*.pth"]:
+            for source in sorted(self.result_dir.glob(pattern)):
+                self._move_legacy_checkpoint(source)
+
     def setup_file_logging(self) -> None:
         setup_output_log(
             result_dir=self.result_dir,
@@ -111,6 +154,7 @@ class Trainer:
         if self.rank == 0:
             ensure_hf_vidit_assets(self.config)
             ensure_vidit_assets(self.config)
+            ensure_vae_assets(self.config)
         self.barrier()
 
     def setup_datasets(self) -> None:
@@ -202,6 +246,7 @@ class Trainer:
         if "optimizer" in checkpoint:
             self.optimizer.load_state_dict(checkpoint["optimizer"])
         self.start_epoch = int(checkpoint.get("epoch", -1)) + 1
+        self.best_checkpoint_score = float(checkpoint.get("best_score", checkpoint.get("score", self.best_checkpoint_score)))
 
     def train(self) -> None:
         self.start_epoch = getattr(self, "start_epoch", 0)
@@ -220,26 +265,38 @@ class Trainer:
         if self.wandb_run is not None:
             self.wandb_run.log(floats, step=step)
 
-    def save_checkpoint(self, epoch: int, name: str | None = None) -> None:
+    def save_checkpoint(self, epoch: int, name: str | None = None, score: float | None = None) -> bool:
         if self.rank != 0:
-            return
+            return False
         filename = name or f"epoch_{epoch:04d}.pth"
-        path = self.result_dir / filename
+        path = self.checkpoint_dir / filename
+        is_best = score is not None and score < self.best_checkpoint_score
+        if is_best:
+            self.best_checkpoint_score = float(score)
         checkpoint = {
             "models": state_dict_for_save(self.models),
             "optimizer": self.optimizer.state_dict(),
             "epoch": epoch,
+            "score": score,
+            "best_score": self.best_checkpoint_score,
             "config": OmegaConf.to_container(self.config, resolve=True),
         }
         torch.save(checkpoint, path)
-        torch.save(checkpoint, self.result_dir / "latest.pth")
+        if is_best:
+            best_path = self.checkpoint_dir / "best.pth"
+            best_path.unlink(missing_ok=True)
+            try:
+                os.link(path, best_path)
+            except OSError:
+                shutil.copy2(path, best_path)
         self._prune_checkpoints()
+        return is_best
 
     def _prune_checkpoints(self) -> None:
-        keep = int(self.config.get("keep_last_checkpoints", 0))
+        keep = int(self.config.get("keep_last_checkpoints", 10))
         if keep <= 0:
             return
-        checkpoints = sorted(self.result_dir.glob("epoch_*.pth"))
+        checkpoints = sorted(self.checkpoint_dir.glob("epoch_*.pth"))
         for old_path in checkpoints[:-keep]:
             old_path.unlink(missing_ok=True)
 

@@ -18,3 +18,8 @@ use_source_tokens: true
 light_drop_prob: 0.05
 dense_drop_prob: 0.05
 source_drop_prob: 0.0
+use_cross_attention_condition: true
+cross_attention_layers: 4
+cross_attention_heads: 16
+cross_attention_dropout: 0.0
+cross_attention_mlp_ratio: 2.0

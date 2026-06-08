@@ -21,6 +21,7 @@ train:
   fixed_color_temperature: true
   use_depth: true
   extended_light: false
+  max_pairs_per_scene: null
   track1_source_direction: N
   track1_target_direction: E
   track1_temperature: 5500
@@ -34,6 +35,7 @@ val:
   fixed_color_temperature: true
   use_depth: true
   extended_light: false
+  max_pairs_per_scene: null
   track1_source_direction: N
   track1_target_direction: E
   track1_temperature: 5500
@@ -47,6 +49,7 @@ test:
   fixed_color_temperature: true
   use_depth: true
   extended_light: false
+  max_pairs_per_scene: null
   track1_source_direction: N
   track1_target_direction: E
   track1_temperature: 5500

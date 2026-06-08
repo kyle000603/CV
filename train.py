@@ -14,7 +14,7 @@ import torch.nn as nn
 from hydra.utils import instantiate
 from omegaconf import DictConfig, OmegaConf, open_dict
 
-from trainers.assets import ensure_hf_vidit_assets, ensure_pretrained_checkpoint, ensure_vidit_assets
+from trainers.assets import ensure_hf_vidit_assets, ensure_pretrained_checkpoint, ensure_vae_assets, ensure_vidit_assets
 from trainers.base import Trainer
 from trainers.file_logging import setup_output_log
 from trainers.utils import ensure_dir, next_numbered_run_dir
@@ -119,6 +119,9 @@ def _prepare_assets_once_before_ddp(cfg: DictConfig) -> None:
             ensure_hf_vidit_assets(cfg)
             ensure_vidit_assets(cfg)
             if str(cfg.get("stage", "")) != "ray_pretrain":
+                vae_path = ensure_vae_assets(cfg)
+                if vae_path is not None:
+                    print(f"Prepared pretrained VAE: {vae_path}")
                 checkpoint_path = ensure_pretrained_checkpoint(cfg)
                 if checkpoint_path is not None:
                     print(f"Prepared pretrained checkpoint: {checkpoint_path}")
@@ -168,7 +171,7 @@ def main(cfg: DictConfig) -> None:
     with open_dict(cfg):
         cfg.assets_prepared_before_ddp = True
     trainer_factory = instantiate(cfg.trainer)
-    model: nn.Module = instantiate(cfg.model)
+    model: nn.Module = nn.Identity() if str(cfg.get("stage", "")) == "ray_pretrain" else instantiate(cfg.model)
     trainer: Trainer = trainer_factory(config=cfg, model=model)
     trainer.train()
 

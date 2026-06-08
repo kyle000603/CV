@@ -4,6 +4,8 @@ import csv
 import json
 import random
 import re
+import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -147,6 +149,7 @@ def _to_record(raw: dict[str, Any], root: Path, split: str, examples: list[Path]
         image_path=image_path,
         depth_path=depth_path,
         split=str(raw_split) if raw_split is not None else None,
+        role=str(_metadata_value(raw, ["role"])) if _metadata_value(raw, ["role"]) is not None else None,
     )
 
 
@@ -170,8 +173,46 @@ def _load_metadata_records(root: Path, split: str, examples: list[Path]) -> list
     return records
 
 
+def _first_image_examples(root: Path, limit: int = 5) -> list[Path]:
+    examples: list[Path] = []
+    for path in root.rglob("*"):
+        if path.suffix.lower() in SUPPORTED_EXTENSIONS:
+            examples.append(path)
+            if len(examples) >= limit:
+                break
+    return examples
+
+
+def _strip_depth_suffix(stem: str) -> str:
+    lowered = stem.lower()
+    for suffix in ["_depth", "-depth", "_disp", "-disp", "_normal", "-normal", "_mask", "-mask"]:
+        if lowered.endswith(suffix):
+            return stem[: -len(suffix)]
+    return stem
+
+
+def _depth_index_key(path: Path) -> tuple[str, str]:
+    return path.parent.as_posix(), _strip_depth_suffix(path.stem).lower()
+
+
+def _build_depth_index(paths: list[Path]) -> tuple[dict[tuple[str, str], Path], dict[str, Path]]:
+    by_parent: dict[tuple[str, str], Path] = {}
+    by_stem: dict[str, Path] = {}
+    for path in paths:
+        suffix = path.suffix.lower()
+        if suffix != ".npy" and (suffix not in SUPPORTED_EXTENSIONS or not _is_depth_like(path)):
+            continue
+        parent_key = _depth_index_key(path)
+        stem_key = parent_key[1]
+        by_parent.setdefault(parent_key, path)
+        by_stem.setdefault(stem_key, path)
+    return by_parent, by_stem
+
+
 def _scan_records(root: Path, split: str, examples: list[Path]) -> list[VIDITRecord]:
-    all_images = [path for path in root.rglob("*") if path.suffix.lower() in SUPPORTED_EXTENSIONS]
+    all_paths = [path for path in root.rglob("*") if path.suffix.lower() in {*SUPPORTED_EXTENSIONS, ".npy"}]
+    depth_index = _build_depth_index(all_paths)
+    all_images = [path for path in all_paths if path.suffix.lower() in SUPPORTED_EXTENSIONS]
     split_images = [path for path in all_images if split.lower() in {part.lower() for part in path.parts}]
     image_paths = split_images if split_images else all_images
     records: list[VIDITRecord] = []
@@ -188,7 +229,7 @@ def _scan_records(root: Path, split: str, examples: list[Path]) -> list[VIDITRec
                 direction=direction,
                 temperature=temperature,
                 image_path=path,
-                depth_path=_find_depth_path(path, root),
+                depth_path=_find_depth_path(path, root, depth_index=depth_index),
                 split=split,
             )
         )
@@ -197,21 +238,76 @@ def _scan_records(root: Path, split: str, examples: list[Path]) -> list[VIDITRec
     return records
 
 
-def _find_depth_path(image_path: Path, root: Path) -> Optional[Path]:
-    scene = _parse_filename(image_path)
+def _find_depth_path(
+    image_path: Path,
+    root: Path,
+    depth_index: Optional[tuple[dict[tuple[str, str], Path], dict[str, Path]]] = None,
+) -> Optional[Path]:
     candidates = [
         image_path.with_suffix(".npy"),
         image_path.with_name(f"{image_path.stem}_depth{image_path.suffix}"),
         image_path.with_name(f"{image_path.stem.replace('_rgb', '')}_depth{image_path.suffix}"),
     ]
-    if scene is not None:
-        scene_id = scene[0]
-        candidates.extend(root.rglob(f"{scene_id}*depth*.png"))
-        candidates.extend(root.rglob(f"{scene_id}.npy"))
     for candidate in candidates:
         if candidate.exists() and candidate.suffix.lower() in {*SUPPORTED_EXTENSIONS, ".npy"}:
             return candidate
+    if depth_index is not None:
+        by_parent, by_stem = depth_index
+        key = (image_path.parent.as_posix(), image_path.stem.lower())
+        if key in by_parent:
+            return by_parent[key]
+        return by_stem.get(image_path.stem.lower())
     return None
+
+
+def _relative_path(root: Path, path: Optional[Path]) -> Optional[str]:
+    if path is None:
+        return None
+    try:
+        return path.relative_to(root).as_posix()
+    except ValueError:
+        return path.as_posix()
+
+
+def _record_to_metadata(root: Path, record: VIDITRecord) -> dict[str, Any]:
+    output: dict[str, Any] = {
+        "scene": record.scene,
+        "direction": record.direction,
+        "temperature": record.temperature,
+        "image_path": _relative_path(root, record.image_path),
+        "depth_path": _relative_path(root, record.depth_path),
+        "split": record.split,
+    }
+    if record.role is not None:
+        output["role"] = record.role
+    return output
+
+
+def write_vidit_metadata_manifests(
+    root: str | Path,
+    splits: tuple[str, ...] = ("train", "val"),
+    force: bool = False,
+) -> None:
+    root_path = Path(root)
+    if not root_path.exists():
+        return
+    for split in splits:
+        split_dir = root_path / split
+        if not split_dir.exists():
+            continue
+        manifest_path = split_dir / "metadata.json"
+        if manifest_path.exists() and not force:
+            continue
+        started = time.time()
+        records = _scan_records(root_path, split=split, examples=_first_image_examples(root_path))
+        if not records:
+            continue
+        payload = [_record_to_metadata(root_path, record) for record in records]
+        temp_path = manifest_path.with_suffix(".json.tmp")
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        temp_path.replace(manifest_path)
+        print(f"Wrote VIDIT metadata manifest: {manifest_path} ({len(payload)} records, {time.time() - started:.2f}s)")
 
 
 def _split_aliases(split: str) -> list[str]:
@@ -374,7 +470,7 @@ def _load_records(
 ) -> list[VIDITRecord]:
     if not root.exists():
         raise FileNotFoundError(f"VIDIT root does not exist: {root}")
-    examples = [path for path in root.rglob("*") if path.suffix.lower() in SUPPORTED_EXTENSIONS][:5]
+    examples = _first_image_examples(root)
     records = _load_metadata_records(root, split, examples)
     if records:
         return records
@@ -404,6 +500,141 @@ def _load_records(
     )
 
 
+def _dtype_from_name(name: str | None) -> torch.dtype | None:
+    if name is None:
+        return None
+    key = str(name).lower()
+    if key in {"none", "null", "false"}:
+        return None
+    if key in {"fp16", "float16", "half"}:
+        return torch.float16
+    if key in {"bf16", "bfloat16"}:
+        return torch.bfloat16
+    return torch.float32
+
+
+class VIDITLightDataset(Dataset[dict[str, Any]]):
+    """Single-image VIDIT dataset for RayEncoder pretraining.
+
+    Unlike the relighting dataset, this does not build source-target pairs. It
+    can preload transformed images into RAM so RayEncoder training consumes
+    tensors directly instead of repeatedly decoding images from disk.
+    """
+
+    def __init__(
+        self,
+        root: str,
+        split: str = "train",
+        image_size: int = 256,
+        heldout_directions: Optional[list[str]] = None,
+        extended_light: bool = False,
+        track1_source_direction: str = "N",
+        track1_target_direction: str = "E",
+        track1_temperature: float = 5500.0,
+        preload_images: bool = True,
+        preload_num_workers: int = 32,
+        preload_dtype: str = "float32",
+        repeat_factor: int = 1,
+        **_: Any,
+    ) -> None:
+        super().__init__()
+        self.root = Path(root)
+        self.split = split
+        self.image_size = int(image_size)
+        self.heldout_directions = {item.upper() for item in heldout_directions or []}
+        self.extended_light = extended_light
+        self.repeat_factor = max(int(repeat_factor), 1)
+        self.preload_images = bool(preload_images)
+        self.preload_dtype = _dtype_from_name(preload_dtype)
+        self.transform = transforms.Compose(
+            [
+                transforms.Resize(self.image_size),
+                transforms.CenterCrop(self.image_size),
+                transforms.ToTensor(),
+                transforms.Lambda(lambda x: x * 2.0 - 1.0),
+            ]
+        )
+        records = _load_records(
+            self.root,
+            split,
+            track1_source_direction=track1_source_direction,
+            track1_target_direction=track1_target_direction,
+            track1_temperature=track1_temperature,
+        )
+        self.records = self._filter_records(records)
+        if not self.records:
+            raise ValueError(f"No VIDIT light records found in {self.root} for split='{split}'.")
+        self.lights = [encode_light(record.direction, record.temperature, extended=self.extended_light) for record in self.records]
+        self.rays = [angle_to_ray_vector(direction_name_to_angle(record.direction)) for record in self.records]
+        self.angles = [torch.tensor(direction_name_to_angle(record.direction), dtype=torch.float32) for record in self.records]
+        self._image_cache: list[torch.Tensor] | None = None
+        if self.preload_images:
+            self._preload_images(num_workers=int(preload_num_workers))
+
+    def _filter_records(self, records: list[VIDITRecord]) -> list[VIDITRecord]:
+        filtered: list[VIDITRecord] = []
+        seen_paths: set[Path] = set()
+        for record in records:
+            if record.direction not in VALID_DIRECTIONS or record.image_path in seen_paths:
+                continue
+            if self.heldout_directions:
+                is_heldout = record.direction in self.heldout_directions
+                if self.split.lower() == "train" and is_heldout:
+                    continue
+                if self.split.lower() != "train" and not is_heldout:
+                    continue
+            seen_paths.add(record.image_path)
+            filtered.append(record)
+        return filtered
+
+    def _load_image(self, path: Path) -> torch.Tensor:
+        with Image.open(path) as image:
+            tensor = self.transform(image.convert("RGB"))
+        if self.preload_dtype is not None:
+            tensor = tensor.to(dtype=self.preload_dtype)
+        return tensor.contiguous()
+
+    def _preload_images(self, num_workers: int) -> None:
+        started = time.time()
+        workers = max(min(num_workers, len(self.records)), 1)
+        print(f"Preloading VIDITLightDataset {self.split} images into RAM: {len(self.records)} images, workers={workers}")
+        if workers == 1:
+            self._image_cache = [self._load_image(record.image_path) for record in self.records]
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                self._image_cache = list(executor.map(lambda record: self._load_image(record.image_path), self.records))
+        total_bytes = sum(image.numel() * image.element_size() for image in self._image_cache)
+        print(
+            f"Preloaded VIDITLightDataset {self.split}: "
+            f"{total_bytes / (1024 ** 3):.2f} GiB in {time.time() - started:.2f}s"
+        )
+
+    def __len__(self) -> int:
+        return len(self.records) * self.repeat_factor
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        record_index = index % len(self.records)
+        record = self.records[record_index]
+        image = self._image_cache[record_index] if self._image_cache is not None else self._load_image(record.image_path)
+        light = self.lights[record_index]
+        ray = self.rays[record_index]
+        angle = self.angles[record_index]
+        return {
+            "source_image": image,
+            "image": image,
+            "source_light": light,
+            "source_ray": ray,
+            "source_angle": angle,
+            "y": torch.tensor(0, dtype=torch.long),
+            "source_meta": {
+                "scene": record.scene,
+                "direction": record.direction,
+                "temperature": record.temperature,
+                "image_path": str(record.image_path),
+            },
+        }
+
+
 class VIDITRelightingDataset(Dataset[dict[str, Any]]):
     def __init__(
         self,
@@ -419,6 +650,10 @@ class VIDITRelightingDataset(Dataset[dict[str, Any]]):
         track1_source_direction: str = "N",
         track1_target_direction: str = "E",
         track1_temperature: float = 5500.0,
+        preload_images: bool = False,
+        preload_num_workers: int = 32,
+        preload_dtype: str = "float32",
+        repeat_factor: int = 1,
     ) -> None:
         super().__init__()
         self.root = Path(root)
@@ -429,6 +664,9 @@ class VIDITRelightingDataset(Dataset[dict[str, Any]]):
         self.heldout_directions = {item.upper() for item in heldout_directions or []}
         self.use_depth = use_depth
         self.extended_light = extended_light
+        self.preload_images = bool(preload_images)
+        self.preload_dtype = _dtype_from_name(preload_dtype)
+        self.repeat_factor = max(int(repeat_factor), 1)
         self.transform = transforms.Compose(
             [
                 transforms.Resize(image_size),
@@ -460,6 +698,10 @@ class VIDITRelightingDataset(Dataset[dict[str, Any]]):
                 "Need at least two different light directions for the same scene and color temperature."
                 f"{hint}"
             )
+        self._image_cache: dict[Path, torch.Tensor] | None = None
+        self._depth_cache: dict[Path, torch.Tensor] | None = None
+        if self.preload_images:
+            self._preload_images(num_workers=int(preload_num_workers))
 
     def _filter_records(self, records: list[VIDITRecord]) -> list[VIDITRecord]:
         filtered: list[VIDITRecord] = []
@@ -508,13 +750,62 @@ class VIDITRelightingDataset(Dataset[dict[str, Any]]):
         return pairs
 
     def __len__(self) -> int:
-        return len(self.pairs)
+        return len(self.pairs) * self.repeat_factor
 
     def _load_image(self, path: Path) -> torch.Tensor:
+        if self._image_cache is not None and path in self._image_cache:
+            return self._image_cache[path]
         with Image.open(path) as image:
-            return self.transform(image.convert("RGB"))
+            tensor = self.transform(image.convert("RGB"))
+        if self.preload_dtype is not None:
+            tensor = tensor.to(dtype=self.preload_dtype)
+        return tensor.contiguous()
+
+    def _preload_images(self, num_workers: int) -> None:
+        started = time.time()
+        image_paths = sorted({record.image_path for pair in self.pairs for record in pair})
+        workers = max(min(num_workers, len(image_paths)), 1)
+        print(
+            f"Preloading VIDITRelightingDataset {self.split} images into RAM: "
+            f"{len(image_paths)} images from {len(self.pairs)} pairs, workers={workers}"
+        )
+        if workers == 1:
+            images = [self._load_image_uncached(path) for path in image_paths]
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                images = list(executor.map(self._load_image_uncached, image_paths))
+        self._image_cache = dict(zip(image_paths, images))
+        total_bytes = sum(image.numel() * image.element_size() for image in self._image_cache.values())
+        if self.use_depth:
+            records_by_path = {record.image_path: record for pair in self.pairs for record in pair}
+            records = [records_by_path[path] for path in sorted(records_by_path, key=lambda item: item.as_posix())]
+            if workers == 1:
+                depths = [self._load_depth_uncached(record) for record in records]
+            else:
+                with ThreadPoolExecutor(max_workers=workers) as executor:
+                    depths = list(executor.map(self._load_depth_uncached, records))
+            self._depth_cache = {record.image_path: depth for record, depth in zip(records, depths) if depth is not None}
+            total_bytes += sum(depth.numel() * depth.element_size() for depth in self._depth_cache.values())
+        print(
+            f"Preloaded VIDITRelightingDataset {self.split}: "
+            f"{total_bytes / (1024 ** 3):.2f} GiB in {time.time() - started:.2f}s"
+        )
+
+    def _load_image_uncached(self, path: Path) -> torch.Tensor:
+        with Image.open(path) as image:
+            tensor = self.transform(image.convert("RGB"))
+        if self.preload_dtype is not None:
+            tensor = tensor.to(dtype=self.preload_dtype)
+        return tensor.contiguous()
 
     def _load_depth(self, record: VIDITRecord) -> Optional[torch.Tensor]:
+        if not self.use_depth:
+            return None
+        if self._depth_cache is not None and record.image_path in self._depth_cache:
+            return self._depth_cache[record.image_path]
+        return self._load_depth_uncached(record)
+
+    def _load_depth_uncached(self, record: VIDITRecord) -> Optional[torch.Tensor]:
         if not self.use_depth:
             return None
         if record.depth_path is not None and record.depth_path.exists():
@@ -562,7 +853,7 @@ class VIDITRelightingDataset(Dataset[dict[str, Any]]):
         return torch.tensor(1.0 if is_valid else 0.0, dtype=torch.float32)
 
     def __getitem__(self, index: int) -> dict[str, Any]:
-        source, target = self.pairs[index]
+        source, target = self.pairs[index % len(self.pairs)]
         source_image = self._load_image(source.image_path)
         target_image = self._load_image(target.image_path)
         source_light = encode_light(source.direction, source.temperature, extended=self.extended_light)

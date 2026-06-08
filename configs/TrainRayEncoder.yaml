@@ -8,16 +8,30 @@ stage: ray_pretrain
 loss_mode: minimal
 
 result_name: RayEncoder
-epochs: 20
-batch_size: 64
+epochs: 50
+batch_size: 1024
+num_workers: 24
 log_every: 50
 save_every: 1
-keep_last_checkpoints: 3
+keep_last_checkpoints: 10
+lr: 0.0003
+weight_decay: 0.01
+grad_clip_norm: 1.0
+
+dataloader:
+  global_batch_size: ${batch_size}
+  num_workers: ${num_workers}
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 8
+  drop_last: true
 
 assets:
   sit_pretrained:
     enabled: false
     load: false
+  vae_pretrained:
+    enabled: false
 
 allow_freeze_without_pretrain: true
 
@@ -35,8 +49,55 @@ model:
   light_dim: 9
   dense_cond_channels: 18
 
+tokenizer: null
+
+dataset:
+  train:
+    _target_: dataset.data.vidit.VIDITRelightingDataset
+    root: data/VIDIT_HF
+    split: train
+    image_size: ${image_size}
+    mask_size: ${mask_size}
+    fixed_color_temperature: true
+    use_depth: true
+    extended_light: false
+    max_pairs_per_scene: 16
+    preload_images: true
+    preload_num_workers: 32
+    preload_dtype: float32
+    repeat_factor: 2
+    track1_source_direction: N
+    track1_target_direction: E
+    track1_temperature: 5500
+  val:
+    _target_: dataset.data.vidit.VIDITLightDataset
+    root: data/VIDIT_HF
+    split: val
+    image_size: ${image_size}
+    extended_light: false
+    preload_images: true
+    preload_num_workers: 32
+    preload_dtype: float32
+    repeat_factor: 1
+    track1_source_direction: N
+    track1_target_direction: E
+    track1_temperature: 5500
+  test:
+    _target_: dataset.data.vidit.VIDITLightDataset
+    root: data/VIDIT_HF
+    split: val
+    image_size: ${image_size}
+    extended_light: false
+    preload_images: true
+    preload_num_workers: 32
+    preload_dtype: float32
+    repeat_factor: 1
+    track1_source_direction: N
+    track1_target_direction: E
+    track1_temperature: 5500
+
 light_encoder:
-  hidden_dim: 256
+  hidden_dim: 512
   light_dim: 3
   extended: false
 
@@ -50,6 +111,14 @@ train_light_transfer_transformer: false
 lambda_flow: 0.0
 lambda_transfer: 0.0
 lambda_light_encoder: 1.0
+lambda_ray_direct: 1.0
+lambda_ray_direction_ce: 0.25
+lambda_ray_reference: 0.5
+lambda_ray_physics: 0.1
+lambda_ray_temperature: 0.05
+ray_direction_ce_temperature: 0.07
+ray_physics_q_clip: 2.0
+ray_physics_smooth_l1_beta: 0.1
 
 enable_image_space_losses: false
 decode_loss_every: 0

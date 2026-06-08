@@ -86,7 +86,7 @@ class RectifiedFlow(nn.Module):
         steps = max(int(sample_steps), 1)
         iterator = range(steps)
         if progress:
-            iterator = tqdm(iterator, desc="Sampling")
+            iterator = tqdm(iterator, desc="Sampling", dynamic_ncols=True)
         dt = 1.0 / steps
         for step in iterator:
             t_value = step / steps

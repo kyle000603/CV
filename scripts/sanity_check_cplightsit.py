@@ -56,6 +56,7 @@ def _prepare_sanity_config(cfg: DictConfig) -> None:
     cfg.assets.hf_vidit.enabled = False
     cfg.assets.vidit.enabled = False
     cfg.assets.sit_pretrained.enabled = False
+    cfg.assets.vae_pretrained.enabled = False
     cfg.allow_freeze_without_pretrain = True
     cfg.stage = "cplightsit_finetune"
     cfg.loss_mode = "minimal"
@@ -79,6 +80,12 @@ def _prepare_sanity_config(cfg: DictConfig) -> None:
     cfg.feature_dim = 64
     cfg.token_grid_size = 8
     cfg.token_count = 64
+    cfg.tokenizer = {
+        "_target_": "models.modules.simple_tokenizer.SimpleImageTokenizer",
+        "image_size": 64,
+        "token_grid_size": 8,
+        "feature_dim": 64,
+    }
     cfg.model.input_size = 8
     cfg.model.in_channels = 64
     cfg.model.depth = 2

@@ -116,6 +116,74 @@ def ensure_hf_file(
     return path
 
 
+def ensure_hf_snapshot(
+    repo_id: str,
+    output_dir: str | Path,
+    repo_type: str = "model",
+    cache_dir: str | None = None,
+) -> Path:
+    path = Path(output_dir)
+    if (path / "config.json").exists():
+        print(f"Using existing Hugging Face snapshot: {path}")
+        return path
+
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError as exc:
+        raise RuntimeError(
+            "Hugging Face Hub support is required for this asset source. "
+            "Install it with: python -m pip install -U huggingface_hub"
+        ) from exc
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    print(f"Downloading Hugging Face snapshot {repo_id} -> {path}")
+    snapshot_download(
+        repo_id=repo_id,
+        repo_type=repo_type,
+        local_dir=str(path),
+        cache_dir=cache_dir,
+    )
+    return path
+
+
+def ensure_vae_assets(cfg: DictConfig) -> Path | None:
+    vae_cfg = cfg.get("assets", {}).get("vae_pretrained") if "assets" in cfg else None
+    if vae_cfg is None or not bool(vae_cfg.get("enabled", False)):
+        return None
+    path = Path(str(vae_cfg.get("path", "pretrained/vae/sd-vae-ft-mse")))
+    if (path / "config.json").exists():
+        print(f"Using existing pretrained VAE: {path}")
+        return path
+
+    try:
+        import diffusers  # noqa: F401
+    except ImportError as exc:
+        raise RuntimeError(
+            "CP-LightSiT uses a pretrained VAE tokenizer, but diffusers is not installed. "
+            "Install it in the CV environment with: "
+            "python -m pip install -U diffusers transformers accelerate safetensors"
+        ) from exc
+
+    if bool(vae_cfg.get("disable_xet", True)):
+        os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+
+    repo_id = str(vae_cfg.get("repo_id", "stabilityai/sd-vae-ft-mse"))
+    cache_dir_value = vae_cfg.get("cache_dir", None)
+    cache_dir = None if cache_dir_value is None else str(cache_dir_value)
+    try:
+        return ensure_hf_snapshot(
+            repo_id=repo_id,
+            output_dir=path,
+            repo_type=str(vae_cfg.get("repo_type", "model")),
+            cache_dir=cache_dir,
+        )
+    except Exception:
+        if bool(vae_cfg.get("optional", False)):
+            print(f"Pretrained VAE could not be prepared; continuing without local VAE at {path}.")
+            return None
+        raise
+
+
 def _archive_marker_path(archive_path: Path, output_dir: Path) -> Path:
     safe_name = archive_path.name.replace("/", "_")
     return output_dir / ".cplightsit_assets" / f"{safe_name}.json"
@@ -225,11 +293,14 @@ def _hf_rgb_image_count(root: Path) -> int:
 
 def _hf_marker_matches(root: Path, expected: dict[str, Any], min_images: int) -> bool:
     marker = _hf_vidit_marker_path(root)
-    if not marker.exists() or _hf_rgb_image_count(root) < min_images:
+    if not marker.exists():
         return False
     try:
         actual = json.loads(marker.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
+        return False
+    marker_count = int(actual.get("converted", 0) or 0)
+    if marker_count < min_images and _hf_rgb_image_count(root) < min_images:
         return False
     return all(actual.get(key) == value for key, value in expected.items())
 
@@ -238,6 +309,15 @@ def _write_hf_marker(root: Path, marker: dict[str, Any]) -> None:
     marker_path = _hf_vidit_marker_path(root)
     marker_path.parent.mkdir(parents=True, exist_ok=True)
     marker_path.write_text(json.dumps(marker, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def _ensure_vidit_manifests(root: Path, splits: tuple[str, ...] = ("train", "val")) -> None:
+    try:
+        from dataset.data.vidit import write_vidit_metadata_manifests
+    except Exception as exc:
+        print(f"Skipping VIDIT metadata manifest preparation: {exc}")
+        return
+    write_vidit_metadata_manifests(root, splits=splits)
 
 
 def _safe_token(value: Any) -> str:
@@ -328,7 +408,14 @@ def ensure_hf_vidit_assets(cfg: DictConfig) -> None:
         "disable_xet": disable_xet,
     }
     if not force and _hf_marker_matches(root, marker, min_images):
-        print(f"Using existing Hugging Face VIDIT conversion under {root} ({_hf_rgb_image_count(root)} RGB images)")
+        marker_path = _hf_vidit_marker_path(root)
+        count = 0
+        try:
+            count = int(json.loads(marker_path.read_text(encoding="utf-8")).get("converted", 0) or 0)
+        except (OSError, json.JSONDecodeError):
+            count = _hf_rgb_image_count(root)
+        print(f"Using existing Hugging Face VIDIT conversion under {root} ({count} RGB images)")
+        _ensure_vidit_manifests(root)
         return
 
     if force and root.exists():
@@ -369,6 +456,7 @@ def ensure_hf_vidit_assets(cfg: DictConfig) -> None:
 
     marker.update({"converted": converted, "train_rows": train_count, "val_rows": val_count})
     _write_hf_marker(root, marker)
+    _ensure_vidit_manifests(root)
     print(
         "Prepared Hugging Face VIDIT data: "
         f"{train_count} train rows, {val_count} val rows, root={root}"
@@ -443,9 +531,29 @@ def _compatible_state_dict(
     target_state = target.state_dict()
     compatible: dict[str, torch.Tensor] = {}
     skipped: list[str] = []
+    aliases: dict[str, str] = {
+        "x_embedder.proj.weight": "x_embedder.weight",
+        "x_embedder.proj.bias": "x_embedder.bias",
+    }
     for key, value in source_state.items():
-        if key in target_state and tuple(target_state[key].shape) == tuple(value.shape):
-            compatible[key] = value
+        target_key = aliases.get(key, key)
+        target_key = re.sub(r"^blocks\.(\d+)\.attn\.qkv\.(weight|bias)$", r"blocks.\1.attn.in_proj_\2", target_key)
+        target_key = re.sub(r"^blocks\.(\d+)\.attn\.proj\.(weight|bias)$", r"blocks.\1.attn.out_proj.\2", target_key)
+        target_key = re.sub(r"^blocks\.(\d+)\.mlp\.fc1\.(weight|bias)$", r"blocks.\1.mlp.0.\2", target_key)
+        target_key = re.sub(r"^blocks\.(\d+)\.mlp\.fc2\.(weight|bias)$", r"blocks.\1.mlp.2.\2", target_key)
+        target_value = target_state.get(target_key)
+        source_value = value
+        if key == "x_embedder.proj.weight" and target_value is not None and value.ndim == 4:
+            source_value = value.flatten(1)
+        if target_value is not None and tuple(target_value.shape) == tuple(source_value.shape):
+            compatible[target_key] = source_value
+        elif (
+            target_value is not None
+            and target_key in {"final_layer.linear.weight", "final_layer.linear.bias"}
+            and source_value.shape[0] >= target_value.shape[0]
+            and tuple(source_value.shape[1:]) == tuple(target_value.shape[1:])
+        ):
+            compatible[target_key] = source_value[: target_value.shape[0]]
         else:
             skipped.append(key)
     return compatible, skipped

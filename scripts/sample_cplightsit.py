@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -68,7 +69,7 @@ def _load_image(path: Path, image_size: int) -> torch.Tensor:
 
 def _save_model_image(tensor: torch.Tensor, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    safe = torch.nan_to_num(tensor.detach().cpu(), nan=0.0, posinf=1.0, neginf=-1.0)
+    safe = torch.nan_to_num(tensor.detach().float().cpu(), nan=0.0, posinf=1.0, neginf=-1.0)
     image = image_to_unit_range(safe.squeeze(0)).permute(1, 2, 0).numpy()
     Image.fromarray((image.clip(0.0, 1.0) * 255.0).astype("uint8"), mode="RGB").save(path)
 
@@ -93,6 +94,19 @@ def _load_checkpoint(checkpoint: dict[str, Any], modules: dict[str, torch.nn.Mod
             module.load_state_dict(filtered, strict=False)
 
 
+def _resolve_amp_dtype(cfg: DictConfig) -> torch.dtype:
+    dtype_name = str(cfg.get("amp_dtype", "bfloat16")).lower()
+    if dtype_name in {"fp16", "float16", "half"}:
+        return torch.float16
+    return torch.bfloat16
+
+
+def _autocast_context(cfg: DictConfig, device: torch.device) -> Any:
+    if device.type != "cuda" or not bool(cfg.get("amp_enabled", True)):
+        return nullcontext()
+    return torch.autocast(device_type="cuda", dtype=_resolve_amp_dtype(cfg))
+
+
 def main() -> None:
     args = _parse_args()
     torch.manual_seed(args.seed)
@@ -104,14 +118,17 @@ def main() -> None:
     light_encoder = instantiate(cfg.light_encoder).to(device).eval()
     physics_light_transfer = instantiate(cfg.physics_light_transfer).to(device).eval()
     light_transfer_transformer = instantiate(cfg.light_transfer_transformer).to(device).eval()
-    tokenizer = instantiate(
-        {
-            "_target_": "models.modules.simple_tokenizer.SimpleImageTokenizer",
-            "image_size": cfg.image_size,
-            "token_grid_size": cfg.token_grid_size,
-            "feature_dim": cfg.feature_dim,
-        }
-    ).to(device).eval()
+    if "tokenizer" in cfg:
+        tokenizer = instantiate(cfg.tokenizer).to(device).eval()
+    else:
+        tokenizer = instantiate(
+            {
+                "_target_": "models.modules.simple_tokenizer.SimpleImageTokenizer",
+                "image_size": cfg.image_size,
+                "token_grid_size": cfg.token_grid_size,
+                "feature_dim": cfg.feature_dim,
+            }
+        ).to(device).eval()
     _load_checkpoint(
         checkpoint,
         {
@@ -124,52 +141,53 @@ def main() -> None:
 
     source_image = _load_image(Path(args.source_image), int(cfg.image_size)).to(device)
     with torch.no_grad():
-        source_pred = light_encoder(source_image)
-        source_light = source_pred["light"]
-        source_ray = source_pred["ray"]
-        if args.target_rotation_deg is None:
-            target_light = encode_light(args.target_direction, args.target_temperature, extended=False).to(device).unsqueeze(0)
-            target_ray = light_to_ray(target_light)
-        else:
-            delta_angle = torch.tensor([args.target_rotation_deg], dtype=source_ray.dtype, device=device)
-            target_ray = rotate_ray_z(source_ray, delta_angle)
-            target_temp = torch.tensor(
-                [[(args.target_temperature - 5500.0) / 2500.0]],
-                dtype=source_ray.dtype,
-                device=device,
+        with _autocast_context(cfg, device):
+            source_pred = light_encoder(source_image)
+            source_light = source_pred["light"]
+            source_ray = source_pred["ray"]
+            if args.target_rotation_deg is None:
+                target_light = encode_light(args.target_direction, args.target_temperature, extended=False).to(device).unsqueeze(0)
+                target_ray = light_to_ray(target_light)
+            else:
+                delta_angle = torch.tensor([args.target_rotation_deg], dtype=source_ray.dtype, device=device)
+                target_ray = rotate_ray_z(source_ray, delta_angle)
+                target_temp = torch.tensor(
+                    [[(args.target_temperature - 5500.0) / 2500.0]],
+                    dtype=source_ray.dtype,
+                    device=device,
+                )
+                target_light = ray_to_light(target_ray, target_temp)
+            physics = physics_light_transfer(
+                source_image,
+                source_light,
+                target_light,
+                depth=None,
+                source_ray=source_ray,
+                target_ray=target_ray,
             )
-            target_light = ray_to_light(target_ray, target_temp)
-        physics = physics_light_transfer(
-            source_image,
-            source_light,
-            target_light,
-            depth=None,
-            source_ray=source_ray,
-            target_ray=target_ray,
-        )
-        transfer = light_transfer_transformer(source_image, source_light, target_light, physics)
-        source_tokens = tokenizer.encode(source_image)
-        z = torch.randn_like(source_tokens)
-        light_cond = torch.cat([source_light, target_light, target_light - source_light], dim=1)
-        cond = {
-            "y": torch.zeros(1, dtype=torch.long, device=device),
-            "light_cond": light_cond,
-            "dense_cond": transfer["dense_cond"],
-            "source_tokens": source_tokens,
-        }
-        flow = TrajectoryFlow(model)
-        sample_steps = args.num_steps or int(cfg.diffusion.inference.sample_steps)
-        sampled_tokens = flow.sample(
-            z,
-            cond=cond,
-            sample_steps=sample_steps,
-            cfg=float(cfg.diffusion.inference.cfg),
-            mode=str(cfg.diffusion.inference.mode),
-            timestep_shift=float(cfg.diffusion.inference.timestep_shift),
-            cfg_mode=str(cfg.diffusion.inference.cfg_mode),
-            progress=True,
-        )
-        relit = tokenizer.decode(sampled_tokens)
+            transfer = light_transfer_transformer(source_image, source_light, target_light, physics)
+            source_tokens = tokenizer.encode(source_image)
+            z = torch.randn_like(source_tokens)
+            light_cond = torch.cat([source_light, target_light, target_light - source_light], dim=1)
+            cond = {
+                "y": torch.zeros(1, dtype=torch.long, device=device),
+                "light_cond": light_cond,
+                "dense_cond": transfer["dense_cond"],
+                "source_tokens": source_tokens,
+            }
+            flow = TrajectoryFlow(model)
+            sample_steps = args.num_steps or int(cfg.diffusion.inference.sample_steps)
+            sampled_tokens = flow.sample(
+                z,
+                cond=cond,
+                sample_steps=sample_steps,
+                cfg=float(cfg.diffusion.inference.cfg),
+                mode=str(cfg.diffusion.inference.mode),
+                timestep_shift=float(cfg.diffusion.inference.timestep_shift),
+                cfg_mode=str(cfg.diffusion.inference.cfg_mode),
+                progress=True,
+            )
+            relit = tokenizer.decode(sampled_tokens)
 
     output_path = Path(args.output)
     _save_model_image(relit, output_path)

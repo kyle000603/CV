@@ -62,4 +62,10 @@ def next_numbered_run_dir(
 
 
 def state_dict_for_save(models: dict[str, nn.Module]) -> dict[str, Any]:
-    return {name: unwrap_model(model).state_dict() for name, model in models.items()}
+    output: dict[str, Any] = {}
+    for name, model in models.items():
+        module = unwrap_model(model)
+        if bool(getattr(module, "_cplightsit_skip_checkpoint", False)):
+            continue
+        output[name] = module.state_dict()
+    return output
