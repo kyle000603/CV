@@ -1,0 +1,4 @@
+defaults:
+  - TrainCPLightSiT
+  - _self_
+

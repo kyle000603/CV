@@ -1,0 +1,133 @@
+defaults:
+  - dataset: vidit
+  - dataloader: base
+  - model: CP_LightSiT_XL
+  - loss: CPLightSiTLosses
+  - trainer: CPLightSiTTrainer
+  - optimizer: AdamW
+  - diffusion: TrajectoryFlow
+  - wandb: local
+  - _self_
+
+project: CPLightSiT
+note: vidit_shadow_consistent_light_transfer
+stage: cplightsit_finetune
+loss_mode: minimal
+
+image_size: 256
+mask_size: 16
+num_workers: 4
+batch_size: 16
+global_seed: 0
+
+epochs: 100
+result_root: checkpoint
+result_name: CPLightSiT
+result_index_width: 3
+use_numbered_result_dir: true
+result_dir: checkpoint/001_CPLightSiT
+log_to_file: true
+log_rank_zero_only: true
+log_ddp_wrapped_modules: true
+ddp_find_unused_parameters: false
+silent_nonzero_rank_wait: true
+log_every: 100
+save_every: 1
+keep_last_checkpoints: 5
+checkpoint: null
+ray_encoder_checkpoint: null
+
+feature_dim: 392
+token_grid_size: 16
+token_count: 256
+
+use_gt_source_light_prob: 0.5
+freeze_backbone: true
+freeze_ray_encoder: true
+freeze_light_encoder: true
+freeze_tokenizer: true
+train_condition_adapters_only: true
+train_light_transfer_transformer: true
+allow_freeze_without_pretrain: false
+detach_dense_cond_from_flow: false
+enable_image_space_losses: false
+decode_loss_every: 0
+debug_one_batch: false
+q_clip: 2.0
+transfer_smooth_l1_beta: 0.1
+lr: 0.0001
+backbone_lr: 0.0
+adapter_lr: 0.0001
+light_transfer_lr: 0.0001
+weight_decay: 0.01
+grad_clip_norm: 1.0
+
+lambda_flow: 1.0
+lambda_transfer: 0.1
+
+light_encoder:
+  _target_: models.modules.ray_encoder.RayEncoder
+  light_dim: 3
+  hidden_dim: 256
+  extended: false
+
+physics_light_transfer:
+  _target_: models.modules.physics_light_transfer.PhysicsLightTransfer
+  tau_remove: 0.15
+  tau_create: 0.15
+  prior_temperature: 0.05
+  use_visibility: false
+
+light_transfer_transformer:
+  _target_: models.modules.light_transfer_transformer.LightTransferTransformer
+  in_image_channels: 3
+  light_dim: 3
+  physics_map_channels: 18
+  output_dense_channels: 18
+  hidden_size: 256
+  depth: 4
+  num_heads: 4
+  patch_size: 8
+  dropout: 0.0
+
+assets:
+  hf_vidit:
+    enabled: true
+    dataset_name: Nahrawy/VIDIT-Depth-ControlNet
+    split: train
+    root: data/VIDIT_HF
+    cache_dir: data/hf_cache
+    val_fraction: 0.1
+    seed: ${global_seed}
+    min_images: 100
+    max_items: null
+    force: false
+    disable_xet: true
+  vidit:
+    enabled: false
+    root: data/VIDIT
+    min_images: 100
+    archives:
+      - url: https://datasets.epfl.ch/vidit/NTIRE2021/track1_train.zip
+        path: data/VIDIT/track1_train.zip
+        extract_to: data/VIDIT
+      - url: https://datasets.epfl.ch/vidit/NTIRE2021/track1_validation.zip
+        path: data/VIDIT/track1_validation.zip
+        extract_to: data/VIDIT
+      - url: https://datasets.epfl.ch/vidit/NTIRE2021/track1_validation_gt.zip
+        path: data/VIDIT/track1_validation_gt.zip
+        extract_to: data/VIDIT
+      - url: https://datasets.epfl.ch/vidit/NTIRE2021/track1_test.zip
+        path: data/VIDIT/track1_test.zip
+        extract_to: data/VIDIT
+  sit_pretrained:
+    enabled: true
+    load: true
+    require_match: false
+    optional: false
+    hf_repo_id: nyu-visionx/SiT-collections
+    hf_filename: SiT-XL-2-256.pt
+    hf_repo_type: model
+    url: "https://www.dl.dropboxusercontent.com/scl/fi/as9oeomcbub47de5g4be0/SiT-XL-2-256.pt?rlkey=uxzxmpicu46coq3msb17b9ofa&dl=0"
+    path: pretrained/SiT-XL-2-256x256.pt
+    sha256: null

@@ -1,8 +1,8 @@
 defaults:
-  - TrainCPLightDiT
+  - TrainCPLightSiT
   - _self_
 
-project: CPLightDiT
+project: CPLightSiT
 note: ray_encoder_pretrain
 stage: ray_pretrain
 loss_mode: minimal

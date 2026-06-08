@@ -144,13 +144,18 @@ class Trainer:
     def wrap_ddp_models(self) -> None:
         if self.world_size <= 1:
             return
+        wrapped_names: list[str] = []
         for name, model in list(self.models.items()):
             if not any(param.requires_grad for param in model.parameters()):
                 continue
             self.models[name] = DistributedDataParallel(
                 model,
                 device_ids=[self.local_rank] if torch.cuda.is_available() else None,
+                find_unused_parameters=bool(self.config.get("ddp_find_unused_parameters", False)),
             )
+            wrapped_names.append(name)
+        if self.rank == 0 and bool(self.config.get("log_ddp_wrapped_modules", True)):
+            print(f"DDP wrapping trainable modules: {', '.join(wrapped_names) if wrapped_names else 'none'}")
 
     def setup_optimizer(self) -> None:
         parameters = [param for model in self.models.values() for param in model.parameters() if param.requires_grad]

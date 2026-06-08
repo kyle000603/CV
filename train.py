@@ -45,7 +45,7 @@ def _asset_preflight_paths(cfg: DictConfig) -> tuple[Path, Path]:
     assets_payload = OmegaConf.to_container(cfg.get("assets", {}), resolve=True)
     assets_hash = hashlib.sha256(json.dumps(assets_payload, sort_keys=True).encode("utf-8")).hexdigest()[:12]
     launcher_hash = _launcher_hash()
-    marker_dir = _asset_preflight_root(cfg) / ".cplightdit_assets" / "preflight"
+    marker_dir = _asset_preflight_root(cfg) / ".cplightsit_assets" / "preflight"
     stem = f"{launcher_hash}_{assets_hash}"
     return marker_dir / f"{stem}.ready", marker_dir / f"{stem}.error"
 
@@ -147,19 +147,19 @@ def _prepare_assets_once_before_ddp(cfg: DictConfig) -> None:
             except json.JSONDecodeError:
                 error_payload = {"error": f"Could not read {error_path}"}
             raise RuntimeError(
-                "Rank 0 failed while preparing CP-LightDiT assets before DDP setup: "
+                "Rank 0 failed while preparing CP-LightSiT assets before DDP setup: "
                 f"{error_payload.get('error', 'unknown error')}"
             )
         elapsed = time.time() - start_time
         if timeout_seconds > 0 and elapsed > timeout_seconds:
             raise TimeoutError(f"Timed out waiting for asset preflight marker: {ready_path}")
         if not bool(cfg.get("silent_nonzero_rank_wait", True)) and elapsed - last_notice >= 30.0:
-            print(f"Waiting for rank 0 to prepare CP-LightDiT assets before DDP setup... ({elapsed:.0f}s)")
+            print(f"Waiting for rank 0 to prepare CP-LightSiT assets before DDP setup... ({elapsed:.0f}s)")
             last_notice = elapsed
         time.sleep(5.0)
 
 
-@hydra.main(version_base=None, config_path="configs", config_name="TrainCPLightDiT")
+@hydra.main(version_base=None, config_path="configs", config_name="TrainCPLightSiT")
 def main(cfg: DictConfig) -> None:
     _unused: Any = None
     _prepare_result_dir_once_before_ddp(cfg)

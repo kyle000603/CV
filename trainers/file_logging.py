@@ -12,8 +12,8 @@ class TeeStream:
         self.log_file = log_file
         self.encoding = getattr(stream, "encoding", "utf-8")
         self.errors = getattr(stream, "errors", "replace")
-        self._cplightdit_tee = True
-        self._cplightdit_log_path = str(Path(log_file.name))
+        self._cplightsit_tee = True
+        self._cplightsit_log_path = str(Path(log_file.name))
 
     def write(self, data: str) -> int:
         written = self.stream.write(data)
@@ -66,7 +66,7 @@ def setup_output_log(
         return None
 
     log_path = Path(result_dir) / ("log.txt" if rank == 0 else f"log_rank{rank}.txt")
-    current_log_path = getattr(sys.stdout, "_cplightdit_log_path", None)
+    current_log_path = getattr(sys.stdout, "_cplightsit_log_path", None)
     if current_log_path == str(log_path):
         return log_path
 

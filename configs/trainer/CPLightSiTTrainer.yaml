@@ -1,0 +1,7 @@
+_target_: trainers.trainCPLightSiT.CPLightSiTTrainer
+_partial_: true
+_recursive_: false
+validation_start_epoch: 50
+sample_seed: null
+visual_seed: null
+

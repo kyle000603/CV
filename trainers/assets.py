@@ -118,7 +118,7 @@ def ensure_hf_file(
 
 def _archive_marker_path(archive_path: Path, output_dir: Path) -> Path:
     safe_name = archive_path.name.replace("/", "_")
-    return output_dir / ".cplightdit_assets" / f"{safe_name}.json"
+    return output_dir / ".cplightsit_assets" / f"{safe_name}.json"
 
 
 def _archive_signature(archive_path: Path) -> dict[str, Any]:
@@ -210,7 +210,7 @@ def extract_archive(archive_path: str | Path, output_dir: str | Path) -> None:
 
 
 def _hf_vidit_marker_path(root: Path) -> Path:
-    return root / ".cplightdit_assets" / "hf_vidit.json"
+    return root / ".cplightsit_assets" / "hf_vidit.json"
 
 
 def _hf_rgb_image_count(root: Path) -> int:
@@ -533,8 +533,8 @@ def load_pretrained_backbone(cfg: DictConfig, model: nn.Module, device: torch.de
     )
     if len(compatible) == 0 and bool(dit_cfg.get("require_match", False)):
         raise RuntimeError(
-            "No tensors from the downloaded DiT checkpoint matched this CP-LightDiT model. "
-            "Use a token-space CP-LightDiT checkpoint or set assets.sit_pretrained.require_match=false."
+            "No tensors from the downloaded DiT checkpoint matched this CP-LightSiT model. "
+            "Use a token-space CP-LightSiT checkpoint or set assets.sit_pretrained.require_match=false."
         )
     return len(compatible) > 0
 
