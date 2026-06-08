@@ -76,7 +76,7 @@ The default Hydra config is `configs/TrainCPLightSiT.yaml`.
 Install the Hugging Face dataset dependencies in the CV environment before the first training run:
 
 ```bash
-/home/jovyan/irrlab/anaconda3/envs/CV/bin/python -m pip install -U datasets huggingface_hub pyarrow
+python -m pip install -U datasets huggingface_hub pyarrow
 ```
 
 `train.py` prepares the dataset and pretrained checkpoint before DDP process-group setup. With `torchrun`, rank 0 performs the Hugging Face conversion and SiT checkpoint download first, while the other ranks wait for a local preflight marker. Once preparation is complete, normal DDP initialization and training begin.
@@ -84,7 +84,7 @@ Install the Hugging Face dataset dependencies in the CV environment before the f
 You can also prepare the dataset and pretrained checkpoint manually in a single process:
 
 ```bash
-HF_HUB_DISABLE_XET=1 /home/jovyan/irrlab/anaconda3/envs/CV/bin/python scripts/prepare_cplightsit_assets.py
+HF_HUB_DISABLE_XET=1 python scripts/prepare_cplightsit_assets.py
 ```
 
 Disable automatic asset downloads for local smoke tests with:
@@ -105,18 +105,22 @@ The sanity script creates a temporary VIDIT-like batch, disables automatic downl
 
 The recommended workflow has two stages.
 
-To run both stages in order with DDP, use:
+To run both stages in order with DDP, use the two-stage script:
 
 ```bash
-CUDA_DEVICES=2,3 NPROC_PER_NODE=2 ./train.sh
+DATA_ROOT=data/VIDIT_HF GPUS=0,1 NPROC_PER_NODE=2 scripts/run_two_stage_cplightdit.sh
 ```
 
-`train.sh` first runs `TrainRayEncoder`, reads `checkpoint/latest_RayEncoder.txt`, then starts `TrainCPLightSiT_Minimal` with the freshly saved `ray_encoder_latest.pth`.
+`scripts/run_two_stage_cplightdit.sh` first runs `TrainRayEncoder`, reads `checkpoint/latest_RayEncoder.txt`, then starts `TrainCPLightSiT` with the freshly saved `ray_encoder_latest.pth`. The script name keeps the CP-LightDiT wording from the experiment notes, while the repository config names use CP-LightSiT.
 
 Stage 1 pretrains the RayEncoder on VIDIT illumination labels:
 
 ```bash
-python train.py -cn TrainRayEncoder
+python train.py -cn TrainRayEncoder \
+  epochs=3 \
+  batch_size=128 \
+  dataloader.global_batch_size=128 \
+  +dataset.train.max_pairs_per_scene=8
 ```
 
 Multi-GPU RayEncoder pretraining uses the same single `train.py` entrypoint:
@@ -135,13 +139,18 @@ The RayEncoder run writes a clean RayEncoder-only checkpoint:
 
 ```text
 checkpoint/001_RayEncoder/ray_encoder_latest.pth
+checkpoint/latest_RayEncoder.txt
 ```
 
 Stage 2 finetunes CP-LightSiT with the frozen pretrained SiT backbone, frozen pretrained RayEncoder, trainable condition adapters, trainable `LightTransferTransformer`, and the minimal objective:
 
 ```bash
 python train.py -cn TrainCPLightSiT_Minimal \
-  ray_encoder_checkpoint=checkpoint/001_RayEncoder/ray_encoder_latest.pth
+  ray_encoder_checkpoint=checkpoint/001_RayEncoder/ray_encoder_latest.pth \
+  epochs=5 \
+  batch_size=16 \
+  dataloader.global_batch_size=16 \
+  +dataset.train.max_pairs_per_scene=8
 ```
 
 This uses the default XL model, minimal fine-tuning objective, and writes checkpoints under the next numbered directory such as `checkpoint/001_CPLightSiT`.
@@ -175,6 +184,8 @@ L_total = L_flow + lambda_transfer * L_transfer
 - Endpoint images are not decoded during training when `decode_loss_every=0`.
 
 Fine-tuning defaults freeze the pretrained SiT backbone and train only the condition adapters plus `LightTransferTransformer`. `RayEncoder` and `SimpleImageTokenizer` are frozen by default. If `freeze_backbone=true`, a pretrained checkpoint must be loaded unless `allow_freeze_without_pretrain=true` is set explicitly.
+
+For quick results, use `RAY_EPOCHS=3 FINETUNE_EPOCHS=5 MAX_PAIRS_PER_SCENE=8`. For more stable presentation runs, use `RAY_EPOCHS=5 FINETUNE_EPOCHS=10 MAX_PAIRS_PER_SCENE=16`.
 
 Equivalent explicit command:
 

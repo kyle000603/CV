@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Iterable, Optional
 
 import torch
@@ -94,13 +95,15 @@ class CPLightSiTTrainer(Trainer):
         raise ValueError("RayEncoder checkpoint did not contain tensor weights.")
 
     def load_ray_encoder_checkpoint_if_needed(self) -> None:
-        """Load only RayEncoder weights from a separate checkpoint."""
+        """Load only RayEncoder weights from a separate checkpoint for finetuning."""
         if self.stage != "cplightsit_finetune":
             return
         checkpoint_value = self.config.get("ray_encoder_checkpoint", None)
         if checkpoint_value is None or str(checkpoint_value).strip() == "":
             return
-        checkpoint_path = str(checkpoint_value)
+        checkpoint_path = Path(str(checkpoint_value))
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(f"RayEncoder checkpoint does not exist: {checkpoint_path}")
         checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
         source_state = self._extract_ray_encoder_state_dict(checkpoint)
         target = unwrap_model(self.models["light_encoder"])
@@ -115,16 +118,13 @@ class CPLightSiTTrainer(Trainer):
         if not compatible:
             raise RuntimeError(f"No compatible RayEncoder tensors were found in {checkpoint_path}.")
         missing, unexpected = target.load_state_dict(compatible, strict=False)
+        self._apply_trainable_policy()
         if self.rank == 0:
-            print(
-                "Loaded RayEncoder checkpoint: "
-                f"{len(compatible)} keys loaded, {len(skipped)} skipped, "
-                f"{len(missing)} missing, {len(unexpected)} unexpected."
-            )
-            if missing:
-                print(f"RayEncoder missing keys: {missing}")
-            if unexpected:
-                print(f"RayEncoder unexpected keys: {unexpected}")
+            print(f"RayEncoder checkpoint path: {checkpoint_path}")
+            print(f"RayEncoder loaded keys: {len(compatible)}")
+            print(f"RayEncoder skipped keys: {len(skipped)}")
+            print(f"RayEncoder missing keys: {list(missing)}")
+            print(f"RayEncoder unexpected keys: {list(unexpected)}")
 
     def setup_optimizer(self) -> None:
         param_groups = self._optimizer_param_groups()
@@ -392,6 +392,9 @@ class CPLightSiTTrainer(Trainer):
         }
         torch.save(checkpoint, self.result_dir / f"ray_encoder_epoch_{epoch:04d}.pth")
         torch.save(checkpoint, self.result_dir / "ray_encoder_latest.pth")
+        pointer = Path(str(self.config.get("result_root", "checkpoint"))) / "latest_RayEncoder.txt"
+        pointer.parent.mkdir(parents=True, exist_ok=True)
+        pointer.write_text(str(self.result_dir), encoding="utf-8")
 
     def train_process(self) -> None:
         epochs = int(self.config.epochs)

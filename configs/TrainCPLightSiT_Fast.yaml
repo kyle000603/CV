@@ -1,0 +1,19 @@
+defaults:
+  - TrainCPLightSiT
+  - _self_
+
+epochs: 5
+batch_size: 16
+
+dataloader:
+  global_batch_size: 16
+
+lambda_transfer: 0.1
+enable_image_space_losses: false
+decode_loss_every: 0
+
+freeze_backbone: true
+freeze_ray_encoder: true
+freeze_tokenizer: true
+train_condition_adapters_only: true
+train_light_transfer_transformer: true

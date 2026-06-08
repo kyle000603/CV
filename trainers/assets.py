@@ -99,7 +99,7 @@ def ensure_hf_file(
     except ImportError as exc:
         raise RuntimeError(
             "Hugging Face Hub support is required for this pretrained checkpoint source. "
-            "Install it with: /home/jovyan/irrlab/anaconda3/envs/CV/bin/python -m pip install -U huggingface_hub"
+            "Install it with: python -m pip install -U huggingface_hub"
         ) from exc
 
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -342,7 +342,7 @@ def ensure_hf_vidit_assets(cfg: DictConfig) -> None:
         raise RuntimeError(
             "assets.hf_vidit.enabled=true requires Hugging Face datasets support. "
             "Install it in the CV environment with: "
-            "/home/jovyan/irrlab/anaconda3/envs/CV/bin/python -m pip install -U datasets huggingface_hub pyarrow"
+            "python -m pip install -U datasets huggingface_hub pyarrow"
         ) from exc
 
     print(f"Loading Hugging Face VIDIT dataset: {dataset_name} split={dataset_split}")

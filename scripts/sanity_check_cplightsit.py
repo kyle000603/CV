@@ -99,6 +99,44 @@ def _assert_finite(name: str, value: Any) -> None:
             _assert_finite(f"{name}.{key}", item)
 
 
+def _assert_dense_transfer_contract(trainer: Any, cfg: DictConfig, batch: dict[str, torch.Tensor]) -> None:
+    moved = trainer._move_tensor_batch(batch)
+    source_image = moved["source_image"]
+    source_light = moved["source_light"]
+    target_light = moved["target_light"]
+    source_ray = moved.get("source_ray")
+    target_ray = moved.get("target_ray")
+    depth = moved.get("depth")
+    depth_valid = moved.get("depth_valid")
+    assert torch.is_tensor(source_image)
+    assert torch.is_tensor(source_light)
+    assert torch.is_tensor(target_light)
+    physics = trainer.physics_light_transfer(
+        source_image,
+        source_light,
+        target_light,
+        depth if torch.is_tensor(depth) else None,
+        source_ray=source_ray if torch.is_tensor(source_ray) else None,
+        target_ray=target_ray if torch.is_tensor(target_ray) else None,
+        depth_valid=depth_valid if torch.is_tensor(depth_valid) else None,
+    )
+    if int(cfg.light_transfer_transformer.output_dense_channels) == 18:
+        for key in ["source_ray_map", "target_ray_map", "source_response", "target_response"]:
+            assert key in physics, f"PhysicsLightTransfer missing {key}"
+        assert int(cfg.model.dense_cond_channels) == 18, "CP-LightSiT dense_cond_channels should be 18."
+    transfer = trainer.light_transfer_transformer(source_image, source_light, target_light, physics)
+    expected_channels = int(cfg.light_transfer_transformer.output_dense_channels)
+    assert transfer["dense_cond"].shape[1] == expected_channels, "Dense condition channel mismatch."
+
+
+def _assert_ray_encoder_checkpoint_loader(trainer: Any, cfg: DictConfig) -> None:
+    checkpoint_path = Path(str(cfg.result_root)) / "dummy_ray_encoder.pth"
+    torch.save({"light_encoder": unwrap_model(trainer.models["light_encoder"]).state_dict()}, checkpoint_path)
+    cfg.ray_encoder_checkpoint = str(checkpoint_path)
+    trainer.load_ray_encoder_checkpoint_if_needed()
+    assert count_trainable_parameters(unwrap_model(trainer.models["light_encoder"])) == 0, "RayEncoder should remain frozen."
+
+
 @hydra.main(version_base=None, config_path="../configs", config_name="TrainCPLightSiT_Minimal")
 def main(cfg: DictConfig) -> None:
     _prepare_sanity_config(cfg)
@@ -106,6 +144,8 @@ def main(cfg: DictConfig) -> None:
     model = instantiate(cfg.model)
     trainer = trainer_factory(config=cfg, model=model)
     batch = next(iter(trainer.train_dataloader))
+    _assert_dense_transfer_contract(trainer, cfg, batch)
+    _assert_ray_encoder_checkpoint_loader(trainer, cfg)
     losses = trainer.train_single_step(batch)
     _assert_finite("losses", losses)
     expected_total = float(cfg.lambda_flow) * losses["Train/flow/loss"] + float(cfg.lambda_transfer) * losses["Train/transfer/loss"]

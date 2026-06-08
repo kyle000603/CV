@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-TORCHRUN_BIN="${TORCHRUN_BIN:-/home/jovyan/irrlab/anaconda3/envs/CV/bin/torchrun}"
+TORCHRUN_BIN="${TORCHRUN_BIN:-torchrun}"
 CUDA_DEVICES="${CUDA_DEVICES-0,1}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-2}"
 RESULT_ROOT="${RESULT_ROOT:-checkpoint}"
