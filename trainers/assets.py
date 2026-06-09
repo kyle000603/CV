@@ -7,9 +7,11 @@ import random
 import re
 import shutil
 import tarfile
+import time
 import urllib.error
 import urllib.request
 import zipfile
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +22,32 @@ from omegaconf import DictConfig, OmegaConf
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg"}
 HF_VIDIT_MARKER_VERSION = 1
+
+
+@contextmanager
+def _temporary_env(name: str, value: str | None) -> Any:
+    old_exists = name in os.environ
+    old_value = os.environ.get(name)
+    if value is None:
+        os.environ.pop(name, None)
+    else:
+        os.environ[name] = value
+    try:
+        yield
+    finally:
+        if old_exists and old_value is not None:
+            os.environ[name] = old_value
+        else:
+            os.environ.pop(name, None)
+
+
+@contextmanager
+def _hf_xet_env(disable_xet: bool | None) -> Any:
+    if disable_xet is None:
+        yield
+        return
+    with _temporary_env("HF_HUB_DISABLE_XET", "1" if disable_xet else None):
+        yield
 
 
 def count_images(path: str | Path) -> int:
@@ -85,6 +113,10 @@ def ensure_hf_file(
     output_path: str | Path,
     repo_type: str = "model",
     sha256: str | None = None,
+    cache_dir: str | None = None,
+    disable_xet: bool | None = None,
+    retries: int = 4,
+    retry_sleep: float = 10.0,
 ) -> Path:
     path = Path(output_path)
     if path.exists():
@@ -94,17 +126,44 @@ def ensure_hf_file(
         print(f"Checksum mismatch for {path}; re-downloading from Hugging Face.")
         path.unlink()
 
-    try:
-        from huggingface_hub import hf_hub_download
-    except ImportError as exc:
-        raise RuntimeError(
-            "Hugging Face Hub support is required for this pretrained checkpoint source. "
-            "Install it with: python -m pip install -U huggingface_hub"
-        ) from exc
-
     path.parent.mkdir(parents=True, exist_ok=True)
     print(f"Downloading Hugging Face file {repo_id}/{filename} -> {path}")
-    cached_path = Path(hf_hub_download(repo_id=repo_id, filename=filename, repo_type=repo_type))
+    attempts = max(int(retries), 1)
+    last_error: Exception | None = None
+    cached_path: Path | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            with _hf_xet_env(disable_xet):
+                try:
+                    from huggingface_hub import hf_hub_download
+                except ImportError as exc:
+                    raise RuntimeError(
+                        "Hugging Face Hub support is required for this pretrained checkpoint source. "
+                        "Install it with: python -m pip install -U huggingface_hub"
+                    ) from exc
+                cached_path = Path(
+                    hf_hub_download(
+                        repo_id=repo_id,
+                        filename=filename,
+                        repo_type=repo_type,
+                        cache_dir=cache_dir,
+                        etag_timeout=30,
+                    )
+                )
+            break
+        except Exception as exc:
+            last_error = exc
+            if attempt >= attempts:
+                break
+            sleep_seconds = min(float(retry_sleep) * attempt, 60.0)
+            print(
+                f"Hugging Face download failed on attempt {attempt}/{attempts}: {exc}. "
+                f"Retrying in {sleep_seconds:.0f}s..."
+            )
+            time.sleep(sleep_seconds)
+    if cached_path is None:
+        assert last_error is not None
+        raise last_error
     temp_path = path.with_suffix(path.suffix + ".part")
     shutil.copyfile(cached_path, temp_path)
     temp_path.replace(path)
@@ -395,8 +454,6 @@ def ensure_hf_vidit_assets(cfg: DictConfig) -> None:
     max_items = None if max_items_value is None else int(max_items_value)
     force = bool(hf_cfg.get("force", False))
     disable_xet = bool(hf_cfg.get("disable_xet", True))
-    if disable_xet:
-        os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 
     marker = {
         "version": HF_VIDIT_MARKER_VERSION,
@@ -433,7 +490,8 @@ def ensure_hf_vidit_assets(cfg: DictConfig) -> None:
         ) from exc
 
     print(f"Loading Hugging Face VIDIT dataset: {dataset_name} split={dataset_split}")
-    dataset = load_dataset(dataset_name, split=dataset_split, cache_dir=cache_dir)
+    with _hf_xet_env(disable_xet):
+        dataset = load_dataset(dataset_name, split=dataset_split, cache_dir=cache_dir)
     if max_items is not None:
         dataset = dataset.select(range(min(max_items, len(dataset))))
 
@@ -588,12 +646,18 @@ def ensure_pretrained_checkpoint(cfg: DictConfig) -> Path | None:
     hf_filename = dit_cfg.get("hf_filename", None)
     if hf_repo_id is not None and hf_filename is not None:
         try:
+            cache_dir_value = dit_cfg.get("cache_dir", None)
+            disable_xet_value = dit_cfg.get("disable_xet", None)
             return ensure_hf_file(
                 repo_id=str(hf_repo_id),
                 filename=str(hf_filename),
                 output_path=path,
                 repo_type=str(dit_cfg.get("hf_repo_type", "model")),
                 sha256=checksum_value,
+                cache_dir=None if cache_dir_value is None else str(cache_dir_value),
+                disable_xet=None if disable_xet_value is None else bool(disable_xet_value),
+                retries=int(dit_cfg.get("download_retries", 4)),
+                retry_sleep=float(dit_cfg.get("download_retry_sleep", 10.0)),
             )
         except Exception as exc:
             errors.append(f"Hugging Face source failed: {exc}")

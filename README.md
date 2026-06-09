@@ -50,10 +50,10 @@ By default, `train.py` prepares assets before constructing datasets and models:
 - Converted dataset markers are written under `data/VIDIT_HF/.cplightsit_assets`, so later runs reuse the processed files immediately.
 - EPFL/NTIRE zip downloads are disabled by default because `assets.hf_vidit.enabled=true` is the preferred path. You can re-enable `assets.vidit.enabled=true` if you want to use local Track1 zips.
 - A pretrained Stable-Diffusion VAE is stored under `pretrained/vae/sd-vae-ft-mse` and used as the frozen image tokenizer.
-- Pretrained SiT-XL/2 weights are stored under `pretrained/SiT-XL-2-256x256.pt`. Existing files are reused. The default source is the Hugging Face `nyu-visionx/SiT-collections` mirror, with the original Dropbox URL kept as fallback.
+- Pretrained SiT-L/2 weights are stored under `pretrained/SiT-L-2-256x256.pt`. Existing files are reused. The default source is the Hugging Face `nyu-visionx/SiT-collections` mirror.
 - Training checkpoints are saved under numbered run directories like `checkpoint/001_CPLightSiT`, `checkpoint/002_CPLightSiT`, and so on.
 
-The default pretrained backbone is SiT-XL/2 because the default model config is XL for an A100 40GB setup. The loader imports only tensors whose names and shapes match CP-LightSiT; incompatible image-latent patch weights are skipped safely.
+The default pretrained backbone is SiT-L/2. The loader imports only tensors whose names and shapes match CP-LightSiT; incompatible image-latent patch weights are skipped safely.
 
 Runs made before the VAE tokenizer change used a temporary conv tokenizer and should be treated as invalid for visual inference. Start a new `CP-LightSiT` run after the VAE assets are prepared.
 
@@ -61,24 +61,24 @@ Runs made before the VAE tokenizer change used a temporary conv tokenizer and sh
 
 The default Hydra config is `configs/TrainCPLightSiT.yaml`.
 
-- Model config: `configs/model/CP_LightSiT_XL.yaml`
-- Model size: CP-LightSiT XL, `depth=28`, `hidden_size=1152`, `num_heads=16`
+- Model config: `configs/model/CP_LightSiT_L.yaml`
+- Model size: CP-LightSiT L, `depth=24`, `hidden_size=1024`, `num_heads=16`
 - Image size: `256`
 - VAE latent: `4 x 32 x 32`
 - Token grid: `16 x 16`
 - Feature dim: `16` (`4` latent channels patchified with `patch_size=2`)
 - Batch size: `128`
-- Learning rates: condition adapters and light-transfer transformer `3e-5`, diffusion backbone partial fine-tuning `1e-5`
+- Learning rates: `1e-4` for condition cross-attention, light-transfer transformer, and full diffusion backbone fine-tuning
 - Data loading: `24` workers, `prefetch_factor=8`
 - Precision/performance: `bf16` AMP, CUDA batch prefetch, channels-last image tensors
-- Conditioning: cross-attention over light, dense-transfer, and source-latent context tokens; additive condition adapters are disabled by default
+- Conditioning: cross-attention over light and dense-transfer context tokens only; source latents are used as the flow start, not as cross-attention context
 - Flow start: source VAE latent tokens with `edit_noise_scale=0.02`
-- Epochs: `100`
+- Epochs: `30` for the default diffusion run; extend the same run to `60` if samples and loss are still improving
 - Dataset root: `data/VIDIT_HF`
 - Hugging Face dataset: `Nahrawy/VIDIT-Depth-ControlNet`
 - Hugging Face cache: `data/hf_cache`
 - Pretrained VAE: `pretrained/vae/sd-vae-ft-mse` from `stabilityai/sd-vae-ft-mse`
-- Pretrained SiT checkpoint: `pretrained/SiT-XL-2-256x256.pt` from `nyu-visionx/SiT-collections/SiT-XL-2-256.pt`
+- Pretrained SiT checkpoint: `pretrained/SiT-L-2-256x256.pt` from `nyu-visionx/SiT-collections/SiT-L-2-256.pt`
 - Training checkpoints: numbered directories under `checkpoint/`, for example `checkpoint/001_CPLightSiT`
 - Training log file: `log.txt` inside each numbered checkpoint directory
 - Latest run pointer: `checkpoint/latest_CPLightSiT.txt`
@@ -114,7 +114,7 @@ The sanity script creates a temporary VIDIT-like batch, disables automatic downl
 
 ## Training
 
-The recommended workflow has two stages, each with a 6-run hyperparameter sweep.
+The recommended workflow has two stages: one RayEncoder pretraining run followed by one CP-LightSiT fine-tuning run.
 
 To run both stages in order with DDP, use:
 
@@ -122,23 +122,23 @@ To run both stages in order with DDP, use:
 CUDA_DEVICES=0,1,2,3 NPROC_PER_NODE=4 ./train.sh
 ```
 
-`train.sh` runs `train_encoder.sh` first, which launches 6 `TrainRayEncoder` DDP runs with different learning-rate, batch, pair-sampling, and RayEncoder loss-weight combinations. It writes all encoder sweep results to:
+`train.sh` runs `train_encoder.sh` first, which launches one `TrainRayEncoder` DDP run using the default simple LR setup. It writes the encoder run result to:
 
 ```text
-checkpoint/encoder_sweep_runs.tsv
+checkpoint/encoder_runs.tsv
 ```
 
-After the encoder sweep finishes, `train.sh` selects the RayEncoder checkpoint with the lowest saved validation score, stores a stable copy at:
+After the encoder run finishes, `train.sh` stores a stable copy of the RayEncoder checkpoint at:
 
 ```text
 checkpoint/best_RayEncoder/ray_encoder_best.pth
 checkpoint/best_RayEncoder/best_ray_encoder.json
 ```
 
-Then `train.sh` passes that selected RayEncoder into `train_diffusion.sh`, which launches 6 `TrainCPLightSiT_Minimal` DDP fine-tuning runs with different learning-rate, transfer-loss, source-light mixing, and batch-size combinations. Diffusion sweep results are written to:
+Then `train.sh` passes that selected RayEncoder into `train_diffusion.sh`, which launches one `TrainCPLightSiT_Minimal` DDP fine-tuning run using the default simple LR setup. The diffusion run manifest is written to:
 
 ```text
-checkpoint/diffusion_sweep_runs.tsv
+checkpoint/diffusion_runs.tsv
 ```
 
 You can also run each stage separately:
@@ -154,12 +154,12 @@ Stage-specific overrides can be passed through `RAY_ARGS` and `SIT_ARGS`:
 
 ```bash
 CUDA_DEVICES=0,1,2,3 NPROC_PER_NODE=4 \
-RAY_ARGS="epochs=3 batch_size=256 dataloader.global_batch_size=256" \
-SIT_ARGS="epochs=5 batch_size=128 dataloader.global_batch_size=128 dataset.train.max_pairs_per_scene=8 dataset.val.max_pairs_per_scene=8" \
+RAY_ARGS="epochs=3 batch_size=128 dataloader.global_batch_size=128" \
+SIT_ARGS="epochs=30 batch_size=128 dataloader.global_batch_size=128 dataset.train.max_pairs_per_scene=8 dataset.val.max_pairs_per_scene=8" \
 ./train.sh
 ```
 
-The sweep scripts intentionally apply each run's hyperparameter combination after shared stage overrides, so use `RAY_ARGS` and `SIT_ARGS` mainly for shared settings such as `epochs`, dataset limits, debug flags, or asset toggles.
+Both stage scripts are intentionally simple and run one job each. Use `RAY_ARGS` and `SIT_ARGS` for shared settings such as `epochs`, dataset limits, debug flags, or asset toggles.
 
 For fast DDP startup, `train.py` prepares VIDIT metadata manifests before DDP setup. Existing Hugging Face VIDIT conversions get `train/metadata.json` and `val/metadata.json` generated once, so each rank avoids recursive directory scans.
 
@@ -168,8 +168,8 @@ Stage 1 pretrains the RayEncoder on VIDIT illumination labels:
 ```bash
 python train.py -cn TrainRayEncoder \
   epochs=50 \
-  batch_size=256 \
-  dataloader.global_batch_size=256
+  batch_size=128 \
+  dataloader.global_batch_size=128
 ```
 
 RayEncoder pretraining uses a ViT-B/16 light encoder and reference pairs from `VIDITRelightingDataset`. Each batch contains a source image and a same-scene reference/target image, so the encoder is trained with three stable losses: 8-way direction classification, source-to-reference rotation consistency, and a physics loss that compares predicted Lambertian log-shading transfer against the observed source/reference log-luminance transfer. The paired dataset preloads unique transformed VIDIT images into RAM before the first epoch, so the training loop consumes memory-resident tensors instead of repeatedly decoding images from disk.
@@ -193,18 +193,18 @@ checkpoint/001_RayEncoder/checkpoint/ray_encoder_best.pth
 checkpoint/latest_RayEncoder.txt
 ```
 
-Stage 2 finetunes CP-LightSiT with the pretrained SiT backbone mostly frozen, frozen pretrained RayEncoder, trainable condition cross-attention, trainable `LightTransferTransformer`, and the minimal source-editing objective. By default, additive condition adapters are disabled, and the last 4 DiT blocks, input embedder, and final layer are also fine-tuned with a lower backbone LR:
+Stage 2 finetunes CP-LightSiT-L with frozen pretrained RayEncoder, trainable condition cross-attention, trainable `LightTransferTransformer`, and the minimal source-editing objective. The flow still starts from source VAE tokens, but source tokens are not passed as condition context. By default, additive condition adapters are disabled, and all 24 L-backbone DiT blocks, input embedder, and final layer are fine-tuned with LR `1e-4`:
 
 ```bash
 python train.py -cn TrainCPLightSiT_Minimal \
   ray_encoder_checkpoint=checkpoint/001_RayEncoder/checkpoint/ray_encoder_best.pth \
-  epochs=5 \
+  epochs=30 \
   batch_size=128 \
   dataloader.global_batch_size=128 \
   dataset.train.max_pairs_per_scene=8
 ```
 
-This uses the default XL model, minimal fine-tuning objective, and writes checkpoints under the next numbered directory such as `checkpoint/001_CPLightSiT`.
+This uses the default L model, minimal fine-tuning objective, and writes checkpoints under the next numbered directory such as `checkpoint/001_CPLightSiT`.
 
 Distributed example:
 
@@ -212,7 +212,7 @@ Distributed example:
 CUDA_VISIBLE_DEVICES=2,3 torchrun --rdzv-backend=c10d --rdzv-endpoint=localhost:0 --nproc_per_node=2 train.py -cn TrainCPLightSiT_Minimal ray_encoder_checkpoint=checkpoint/001_RayEncoder/checkpoint/ray_encoder_best.pth
 ```
 
-This single command converts or reuses Hugging Face VIDIT under `data/VIDIT_HF`, downloads or reuses SiT-XL/2 under `pretrained/`, and only then sets up DDP training.
+This single command converts or reuses Hugging Face VIDIT under `data/VIDIT_HF`, downloads or reuses SiT-L/2 under `pretrained/`, and only then sets up DDP training.
 
 For local smoke tests without downloading VIDIT, SiT, or a RayEncoder checkpoint:
 
@@ -234,9 +234,9 @@ L_total = L_flow + lambda_transfer * L_transfer
 - Shadow, reflectance, physics-correlation, linearity, smoothness, ray-rotation, tokenizer-reconstruction, and endpoint image-space losses have been removed from the trainer.
 - Endpoint images are not decoded during training when `decode_loss_every=0`.
 
-Fine-tuning defaults freeze most of the pretrained SiT backbone and train the condition adapters, condition cross-attention blocks, `LightTransferTransformer`, plus a low-LR diffusion subset: `x_embedder`, the last 4 DiT blocks, and `final_layer`. `RayEncoder` and the pretrained VAE tokenizer are frozen by default. If `freeze_backbone=true`, a pretrained checkpoint must be loaded unless `allow_freeze_without_pretrain=true` is set explicitly.
+Fine-tuning defaults train the condition cross-attention blocks, `LightTransferTransformer`, plus the full L diffusion block stack at LR `1e-4`: `x_embedder`, all 24 DiT blocks, and `final_layer`. `RayEncoder` and the pretrained VAE tokenizer are frozen by default. If `freeze_backbone=true`, a pretrained checkpoint must be loaded unless `allow_freeze_without_pretrain=true` is set explicitly.
 
-Default A100 4-GPU batches are `256` for ViT-B reference-pair RayEncoder pretraining and `128` for CP-LightSiT finetuning. RayEncoder computes source/reference images plus physics transfer, so this is intentionally lower than the old single-image setting. If CP-LightSiT memory is tight, lower it to `64`.
+Default A100 4-GPU training batch size is `128` for both ViT-B reference-pair RayEncoder pretraining and CP-LightSiT-L finetuning. For diffusion, start with `30` epochs. If samples improve and the loss is still trending down, resume the same run to `60` epochs.
 
 RayEncoder quality can be inspected separately:
 
@@ -246,10 +246,11 @@ python ray_encoder_inference.py \
   --split val \
   --eval-batch-size 256 \
   --num-workers 8 \
+  --heatmaps \
   --output ray_encoder_report.pdf
 ```
 
-The RayEncoder report includes 8-way direction accuracy, ray cosine, angular error, confidence, a confusion matrix, and the best/worst examples by angular error.
+The RayEncoder report includes 8-way direction accuracy, ray cosine, angular error, confidence, a confusion matrix, and the best/worst examples by angular error. With `--heatmaps`, the report adds a separate heatmap analysis section that groups the same scene under different ground-truth light directions and shows each prediction with its gradient saliency overlay. Use `--heatmap-target gt` to visualize sensitivity to the ground-truth direction class instead of the predicted class.
 
 Equivalent explicit command:
 
@@ -260,8 +261,11 @@ python train.py --config-name TrainCPLightSiT_Minimal \
   loss_mode=minimal \
   freeze_backbone=true \
   train_diffusion_backbone=true \
-  train_diffusion_last_n_blocks=4 \
-  backbone_lr=0.00001 \
+  train_diffusion_last_n_blocks=24 \
+  lr=0.0001 \
+  adapter_lr=0.0001 \
+  light_transfer_lr=0.0001 \
+  backbone_lr=0.0001 \
   ray_encoder_checkpoint=/path/to/ray_encoder_best.pth \
   lambda_flow=1.0 \
   lambda_transfer=0.1

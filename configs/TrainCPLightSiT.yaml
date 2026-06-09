@@ -1,7 +1,7 @@
 defaults:
   - dataset: vidit
   - dataloader: base
-  - model: CP_LightSiT_XL
+  - model: CP_LightSiT_L
   - loss: CPLightSiTLosses
   - trainer: CPLightSiTTrainer
   - optimizer: AdamW
@@ -26,7 +26,7 @@ amp_dtype: bfloat16
 cuda_prefetch: true
 channels_last: true
 
-epochs: 100
+epochs: 30
 result_root: checkpoint
 result_name: CPLightSiT
 result_index_width: 3
@@ -59,7 +59,7 @@ train_diffusion_backbone: true
 train_diffusion_input_embedder: true
 train_diffusion_time_embedder: false
 train_diffusion_label_embedder: false
-train_diffusion_last_n_blocks: 4
+train_diffusion_last_n_blocks: 24
 train_diffusion_final_layer: true
 allow_freeze_without_pretrain: false
 detach_dense_cond_from_flow: false
@@ -70,10 +70,10 @@ edit_noise_scale: 0.02
 debug_one_batch: false
 q_clip: 2.0
 transfer_smooth_l1_beta: 0.1
-lr: 0.00003
-backbone_lr: 0.00001
-adapter_lr: 0.00003
-light_transfer_lr: 0.00003
+lr: 0.0001
+backbone_lr: 0.0001
+adapter_lr: 0.0001
+light_transfer_lr: 0.0001
 weight_decay: 0.01
 grad_clip_norm: 0.5
 
@@ -168,8 +168,12 @@ assets:
     require_match: false
     optional: false
     hf_repo_id: nyu-visionx/SiT-collections
-    hf_filename: SiT-XL-2-256.pt
+    hf_filename: SiT-L-2-256.pt
     hf_repo_type: model
-    url: "https://www.dl.dropboxusercontent.com/scl/fi/as9oeomcbub47de5g4be0/SiT-XL-2-256.pt?rlkey=uxzxmpicu46coq3msb17b9ofa&dl=0"
-    path: pretrained/SiT-XL-2-256x256.pt
+    cache_dir: data/hf_cache
+    disable_xet: false
+    download_retries: 8
+    download_retry_sleep: 15
+    url: null
+    path: pretrained/SiT-L-2-256x256.pt
     sha256: null

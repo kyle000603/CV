@@ -12,7 +12,8 @@ RESULT_ROOT="${RESULT_ROOT:-checkpoint}"
 RAY_CONFIG="${RAY_CONFIG:-TrainRayEncoder}"
 RDZV_BACKEND="${RDZV_BACKEND:-c10d}"
 RDZV_ENDPOINT="${RDZV_ENDPOINT:-localhost:0}"
-ENCODER_SWEEP_MANIFEST="${ENCODER_SWEEP_MANIFEST:-${RESULT_ROOT}/encoder_sweep_runs.tsv}"
+ENCODER_RUN_MANIFEST="${ENCODER_RUN_MANIFEST:-${ENCODER_SWEEP_MANIFEST:-${RESULT_ROOT}/encoder_runs.tsv}}"
+ENCODER_NOTE="${ENCODER_NOTE:-ray_encoder_vitb_lr1e4}"
 
 COMMON_OVERRIDE_ARGS=()
 ENCODER_COMMON_ARGS=()
@@ -70,44 +71,32 @@ normalize_overrides COMMON_OVERRIDE_ARGS
 normalize_overrides ENCODER_COMMON_ARGS
 
 mkdir -p "${RESULT_ROOT}"
-: > "${ENCODER_SWEEP_MANIFEST}"
+: > "${ENCODER_RUN_MANIFEST}"
 
-ENCODER_SWEEPS=(
-  "lr=0.0003 batch_size=256 dataloader.global_batch_size=256 lambda_ray_direction_cls=1.0 lambda_ray_rotation_consistency=0.5 lambda_ray_physics_transfer=0.1 dataset.train.max_pairs_per_scene=16 dataset.train.repeat_factor=2"
-  "lr=0.0002 batch_size=256 dataloader.global_batch_size=256 lambda_ray_direction_cls=1.0 lambda_ray_rotation_consistency=0.5 lambda_ray_physics_transfer=0.1 dataset.train.max_pairs_per_scene=16 dataset.train.repeat_factor=2"
-  "lr=0.0003 batch_size=256 dataloader.global_batch_size=256 lambda_ray_direction_cls=1.25 lambda_ray_rotation_consistency=0.5 lambda_ray_physics_transfer=0.05 dataset.train.max_pairs_per_scene=16 dataset.train.repeat_factor=2"
-  "lr=0.0002 batch_size=256 dataloader.global_batch_size=256 lambda_ray_direction_cls=1.0 lambda_ray_rotation_consistency=0.75 lambda_ray_physics_transfer=0.05 dataset.train.max_pairs_per_scene=16 dataset.train.repeat_factor=2"
-  "lr=0.00015 batch_size=128 dataloader.global_batch_size=128 lambda_ray_direction_cls=1.0 lambda_ray_rotation_consistency=0.75 lambda_ray_physics_transfer=0.1 dataset.train.max_pairs_per_scene=24 dataset.train.repeat_factor=1"
-  "lr=0.0001 batch_size=128 dataloader.global_batch_size=128 lambda_ray_direction_cls=1.5 lambda_ray_rotation_consistency=0.5 lambda_ray_physics_transfer=0.05 dataset.train.max_pairs_per_scene=24 dataset.train.repeat_factor=1"
-)
+echo "[encoder] TrainRayEncoder pretraining"
+echo "  config: ${RAY_CONFIG}"
+echo "  note: ${ENCODER_NOTE}"
 
-for index in "${!ENCODER_SWEEPS[@]}"; do
-  run_id="$(printf "%02d" "$((index + 1))")"
-  read -r -a SWEEP_ARGS <<< "${ENCODER_SWEEPS[$index]}"
-  echo "[encoder ${run_id}/06] TrainRayEncoder sweep"
-  echo "  overrides: ${ENCODER_SWEEPS[$index]}"
-  run_ddp "${RAY_CONFIG}" \
-    "result_root=${RESULT_ROOT}" \
-    "note=ray_encoder_vitb_sweep_${run_id}" \
-    "${COMMON_OVERRIDE_ARGS[@]}" \
-    "${ENCODER_COMMON_ARGS[@]}" \
-    "${SWEEP_ARGS[@]}"
+run_ddp "${RAY_CONFIG}" \
+  "result_root=${RESULT_ROOT}" \
+  "note=${ENCODER_NOTE}" \
+  "${COMMON_OVERRIDE_ARGS[@]}" \
+  "${ENCODER_COMMON_ARGS[@]}"
 
-  pointer="${RESULT_ROOT}/latest_RayEncoder.txt"
-  if [[ ! -f "${pointer}" ]]; then
-    echo "RayEncoder latest pointer was not created: ${pointer}" >&2
-    exit 1
-  fi
-  run_dir="$(tr -d '[:space:]' < "${pointer}")"
-  checkpoint="${run_dir}/checkpoint/ray_encoder_best.pth"
-  if [[ ! -f "${checkpoint}" ]]; then
-    echo "RayEncoder checkpoint was not created: ${checkpoint}" >&2
-    exit 1
-  fi
-  score="$(checkpoint_score "${checkpoint}")"
-  printf "%s\t%s\t%s\t%s\t%s\n" "${run_id}" "${score}" "${run_dir}" "${checkpoint}" "${ENCODER_SWEEPS[$index]}" >> "${ENCODER_SWEEP_MANIFEST}"
-  echo "  run: ${run_dir}"
-  echo "  best score: ${score}"
-done
+pointer="${RESULT_ROOT}/latest_RayEncoder.txt"
+if [[ ! -f "${pointer}" ]]; then
+  echo "RayEncoder latest pointer was not created: ${pointer}" >&2
+  exit 1
+fi
+run_dir="$(tr -d '[:space:]' < "${pointer}")"
+checkpoint="${run_dir}/checkpoint/ray_encoder_best.pth"
+if [[ ! -f "${checkpoint}" ]]; then
+  echo "RayEncoder checkpoint was not created: ${checkpoint}" >&2
+  exit 1
+fi
+score="$(checkpoint_score "${checkpoint}")"
+printf "%s\t%s\t%s\t%s\t%s\n" "single" "${score}" "${run_dir}" "${checkpoint}" "config=${RAY_CONFIG} note=${ENCODER_NOTE}" >> "${ENCODER_RUN_MANIFEST}"
 
-echo "Encoder sweep manifest: ${ENCODER_SWEEP_MANIFEST}"
+echo "RayEncoder run: ${run_dir}"
+echo "Best score: ${score}"
+echo "Encoder run manifest: ${ENCODER_RUN_MANIFEST}"

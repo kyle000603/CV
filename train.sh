@@ -6,16 +6,16 @@ cd "${SCRIPT_DIR}"
 
 PYTHON_BIN="${PYTHON_BIN:-python}"
 RESULT_ROOT="${RESULT_ROOT:-checkpoint}"
-ENCODER_SWEEP_MANIFEST="${ENCODER_SWEEP_MANIFEST:-${RESULT_ROOT}/encoder_sweep_runs.tsv}"
-DIFFUSION_SWEEP_MANIFEST="${DIFFUSION_SWEEP_MANIFEST:-${RESULT_ROOT}/diffusion_sweep_runs.tsv}"
+ENCODER_RUN_MANIFEST="${ENCODER_RUN_MANIFEST:-${ENCODER_SWEEP_MANIFEST:-${RESULT_ROOT}/encoder_runs.tsv}}"
+DIFFUSION_RUN_MANIFEST="${DIFFUSION_RUN_MANIFEST:-${RESULT_ROOT}/diffusion_runs.tsv}"
 BEST_RAY_DIR="${BEST_RAY_DIR:-${RESULT_ROOT}/best_RayEncoder}"
 
-echo "[1/3] Running 6 RayEncoder hyperparameter sweeps"
-ENCODER_SWEEP_MANIFEST="${ENCODER_SWEEP_MANIFEST}" ./train_encoder.sh
+echo "[1/3] Training RayEncoder"
+ENCODER_RUN_MANIFEST="${ENCODER_RUN_MANIFEST}" ./train_encoder.sh
 
-echo "[2/3] Selecting best RayEncoder checkpoint"
+echo "[2/3] Preparing selected RayEncoder checkpoint"
 read -r BEST_RAY_CHECKPOINT BEST_RAY_SCORE BEST_RAY_RUN_DIR < <(
-  "${PYTHON_BIN}" - "${ENCODER_SWEEP_MANIFEST}" "${BEST_RAY_DIR}" <<'PY'
+  "${PYTHON_BIN}" - "${ENCODER_RUN_MANIFEST}" "${BEST_RAY_DIR}" <<'PY'
 import csv
 import json
 import os
@@ -26,7 +26,7 @@ from pathlib import Path
 manifest = Path(sys.argv[1])
 best_dir = Path(sys.argv[2])
 if not manifest.exists():
-    raise SystemExit(f"encoder sweep manifest does not exist: {manifest}")
+    raise SystemExit(f"encoder run manifest does not exist: {manifest}")
 
 rows = []
 with manifest.open("r", encoding="utf-8", newline="") as handle:
@@ -75,8 +75,8 @@ echo "  score: ${BEST_RAY_SCORE}"
 echo "  source run: ${BEST_RAY_RUN_DIR}"
 echo "  metadata: ${BEST_RAY_DIR}/best_ray_encoder.json"
 
-echo "[3/3] Running 6 CP-LightSiT diffusion fine-tuning sweeps"
-RAY_CHECKPOINT="${BEST_RAY_CHECKPOINT}" DIFFUSION_SWEEP_MANIFEST="${DIFFUSION_SWEEP_MANIFEST}" ./train_diffusion.sh
+echo "[3/3] Running CP-LightSiT diffusion fine-tuning"
+RAY_CHECKPOINT="${BEST_RAY_CHECKPOINT}" DIFFUSION_RUN_MANIFEST="${DIFFUSION_RUN_MANIFEST}" ./train_diffusion.sh
 
-echo "Encoder sweep manifest: ${ENCODER_SWEEP_MANIFEST}"
-echo "Diffusion sweep manifest: ${DIFFUSION_SWEEP_MANIFEST}"
+echo "Encoder run manifest: ${ENCODER_RUN_MANIFEST}"
+echo "Diffusion run manifest: ${DIFFUSION_RUN_MANIFEST}"

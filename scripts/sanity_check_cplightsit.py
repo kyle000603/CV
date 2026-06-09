@@ -93,6 +93,8 @@ def _prepare_sanity_config(cfg: DictConfig) -> None:
     cfg.model.num_heads = 4
     cfg.model.mlp_ratio = 2.0
     cfg.light_encoder.hidden_dim = 64
+    cfg.light_encoder.num_heads = 4
+    cfg.light_encoder.depth = 2
     cfg.light_transfer_transformer.hidden_size = 64
     cfg.light_transfer_transformer.depth = 1
     cfg.light_transfer_transformer.patch_size = 8
@@ -144,6 +146,12 @@ def _assert_ray_encoder_checkpoint_loader(trainer: Any, cfg: DictConfig) -> None
     assert count_trainable_parameters(unwrap_model(trainer.models["light_encoder"])) == 0, "RayEncoder should remain frozen."
 
 
+def _assert_source_edit_condition_contract(trainer: Any) -> None:
+    source_tokens = torch.randn(2, 64, 64)
+    assert trainer._flow_start_tokens(source_tokens) is source_tokens, "Source-edit flow should still start from source tokens."
+    assert trainer._source_tokens_condition(source_tokens) is None, "Source tokens should not be passed as condition context."
+
+
 @hydra.main(version_base=None, config_path="../configs", config_name="TrainCPLightSiT_Minimal")
 def main(cfg: DictConfig) -> None:
     _prepare_sanity_config(cfg)
@@ -153,6 +161,7 @@ def main(cfg: DictConfig) -> None:
     batch = next(iter(trainer.train_dataloader))
     _assert_dense_transfer_contract(trainer, cfg, batch)
     _assert_ray_encoder_checkpoint_loader(trainer, cfg)
+    _assert_source_edit_condition_contract(trainer)
     losses = trainer.train_single_step(batch)
     _assert_finite("losses", losses)
     expected_total = float(cfg.lambda_flow) * losses["Train/flow/loss"] + float(cfg.lambda_transfer) * losses["Train/transfer/loss"]

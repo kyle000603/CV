@@ -12,7 +12,8 @@ RESULT_ROOT="${RESULT_ROOT:-checkpoint}"
 SIT_CONFIG="${SIT_CONFIG:-TrainCPLightSiT_Minimal}"
 RDZV_BACKEND="${RDZV_BACKEND:-c10d}"
 RDZV_ENDPOINT="${RDZV_ENDPOINT:-localhost:0}"
-DIFFUSION_SWEEP_MANIFEST="${DIFFUSION_SWEEP_MANIFEST:-${RESULT_ROOT}/diffusion_sweep_runs.tsv}"
+DIFFUSION_RUN_MANIFEST="${DIFFUSION_RUN_MANIFEST:-${DIFFUSION_SWEEP_MANIFEST:-${RESULT_ROOT}/diffusion_runs.tsv}}"
+DIFFUSION_NOTE="${DIFFUSION_NOTE:-cplightsit_lr1e4}"
 
 if [[ -z "${RAY_CHECKPOINT:-}" ]]; then
   echo "RAY_CHECKPOINT must point to the selected ray_encoder_best.pth." >&2
@@ -79,46 +80,34 @@ normalize_overrides COMMON_OVERRIDE_ARGS
 normalize_overrides DIFFUSION_COMMON_ARGS
 
 mkdir -p "${RESULT_ROOT}"
-: > "${DIFFUSION_SWEEP_MANIFEST}"
+: > "${DIFFUSION_RUN_MANIFEST}"
 
-DIFFUSION_SWEEPS=(
-  "flow_start_mode=source edit_noise_scale=0.00 batch_size=128 dataloader.global_batch_size=128 lr=0.000012 adapter_lr=0.000012 light_transfer_lr=0.000010 backbone_lr=0.000002 train_diffusion_backbone=true train_diffusion_last_n_blocks=4 lambda_transfer=0.03 use_gt_source_light_prob=0.75 grad_clip_norm=0.30 q_clip=1.5 transfer_smooth_l1_beta=0.2"
-  "flow_start_mode=source edit_noise_scale=0.02 batch_size=128 dataloader.global_batch_size=128 lr=0.000010 adapter_lr=0.000012 light_transfer_lr=0.000008 backbone_lr=0.000002 train_diffusion_backbone=true train_diffusion_last_n_blocks=8 lambda_transfer=0.03 use_gt_source_light_prob=0.75 grad_clip_norm=0.30 q_clip=1.5 transfer_smooth_l1_beta=0.2"
-  "flow_start_mode=source edit_noise_scale=0.02 batch_size=128 dataloader.global_batch_size=128 lr=0.000008 adapter_lr=0.000010 light_transfer_lr=0.000008 backbone_lr=0.000001 train_diffusion_backbone=true train_diffusion_last_n_blocks=12 lambda_transfer=0.02 use_gt_source_light_prob=0.75 grad_clip_norm=0.25 q_clip=1.25 transfer_smooth_l1_beta=0.25"
-  "flow_start_mode=source edit_noise_scale=0.05 batch_size=128 dataloader.global_batch_size=128 lr=0.000006 adapter_lr=0.000008 light_transfer_lr=0.000006 backbone_lr=0.000001 train_diffusion_backbone=true train_diffusion_last_n_blocks=16 lambda_transfer=0.02 use_gt_source_light_prob=1.0 grad_clip_norm=0.20 q_clip=1.25 transfer_smooth_l1_beta=0.25"
-  "flow_start_mode=source edit_noise_scale=0.00 batch_size=128 dataloader.global_batch_size=128 lr=0.000010 adapter_lr=0.000012 light_transfer_lr=0.000008 backbone_lr=0.000003 train_diffusion_backbone=true train_diffusion_last_n_blocks=8 lambda_transfer=0.05 use_gt_source_light_prob=1.0 grad_clip_norm=0.30 q_clip=1.5 transfer_smooth_l1_beta=0.2"
-  "flow_start_mode=source edit_noise_scale=0.02 batch_size=128 dataloader.global_batch_size=128 lr=0.000008 adapter_lr=0.000010 light_transfer_lr=0.000006 backbone_lr=0.000002 train_diffusion_backbone=true train_diffusion_last_n_blocks=12 lambda_transfer=0.05 use_gt_source_light_prob=1.0 grad_clip_norm=0.25 q_clip=1.5 transfer_smooth_l1_beta=0.2"
-)
+echo "[diffusion] CP-LightSiT fine-tuning"
+echo "  ray encoder: ${RAY_CHECKPOINT}"
+echo "  config: ${SIT_CONFIG}"
+echo "  note: ${DIFFUSION_NOTE}"
 
-for index in "${!DIFFUSION_SWEEPS[@]}"; do
-  run_id="$(printf "%02d" "$((index + 1))")"
-  read -r -a SWEEP_ARGS <<< "${DIFFUSION_SWEEPS[$index]}"
-  echo "[diffusion ${run_id}/06] CP-LightSiT sweep"
-  echo "  ray encoder: ${RAY_CHECKPOINT}"
-  echo "  overrides: ${DIFFUSION_SWEEPS[$index]}"
-  run_ddp "${SIT_CONFIG}" \
-    "result_root=${RESULT_ROOT}" \
-    "ray_encoder_checkpoint=${RAY_CHECKPOINT}" \
-    "note=cplightsit_sweep_${run_id}" \
-    "${COMMON_OVERRIDE_ARGS[@]}" \
-    "${DIFFUSION_COMMON_ARGS[@]}" \
-    "${SWEEP_ARGS[@]}"
+run_ddp "${SIT_CONFIG}" \
+  "result_root=${RESULT_ROOT}" \
+  "ray_encoder_checkpoint=${RAY_CHECKPOINT}" \
+  "note=${DIFFUSION_NOTE}" \
+  "${COMMON_OVERRIDE_ARGS[@]}" \
+  "${DIFFUSION_COMMON_ARGS[@]}"
 
-  pointer="${RESULT_ROOT}/latest_CPLightSiT.txt"
-  if [[ ! -f "${pointer}" ]]; then
-    echo "CP-LightSiT latest pointer was not created: ${pointer}" >&2
-    exit 1
-  fi
-  run_dir="$(tr -d '[:space:]' < "${pointer}")"
-  checkpoint="${run_dir}/checkpoint/best.pth"
-  if [[ ! -f "${checkpoint}" ]]; then
-    echo "CP-LightSiT checkpoint was not created: ${checkpoint}" >&2
-    exit 1
-  fi
-  score="$(checkpoint_score "${checkpoint}")"
-  printf "%s\t%s\t%s\t%s\t%s\n" "${run_id}" "${score}" "${run_dir}" "${checkpoint}" "${DIFFUSION_SWEEPS[$index]}" >> "${DIFFUSION_SWEEP_MANIFEST}"
-  echo "  run: ${run_dir}"
-  echo "  best score: ${score}"
-done
+pointer="${RESULT_ROOT}/latest_CPLightSiT.txt"
+if [[ ! -f "${pointer}" ]]; then
+  echo "CP-LightSiT latest pointer was not created: ${pointer}" >&2
+  exit 1
+fi
+run_dir="$(tr -d '[:space:]' < "${pointer}")"
+checkpoint="${run_dir}/checkpoint/best.pth"
+if [[ ! -f "${checkpoint}" ]]; then
+  echo "CP-LightSiT checkpoint was not created: ${checkpoint}" >&2
+  exit 1
+fi
+score="$(checkpoint_score "${checkpoint}")"
+printf "%s\t%s\t%s\t%s\t%s\n" "single" "${score}" "${run_dir}" "${checkpoint}" "config=${SIT_CONFIG} note=${DIFFUSION_NOTE}" >> "${DIFFUSION_RUN_MANIFEST}"
 
-echo "Diffusion sweep manifest: ${DIFFUSION_SWEEP_MANIFEST}"
+echo "CP-LightSiT run: ${run_dir}"
+echo "Best score: ${score}"
+echo "Diffusion run manifest: ${DIFFUSION_RUN_MANIFEST}"

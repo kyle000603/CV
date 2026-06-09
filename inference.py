@@ -276,12 +276,12 @@ def build_panels(
 ) -> list[tuple[str, Image.Image]]:
     error = (image_to_unit_range(pred) - image_to_unit_range(target)).abs().mean(dim=0, keepdim=True)
     return [
-        ("source", tensor_to_rgb_image(source)),
-        ("target", tensor_to_rgb_image(target)),
-        ("prediction", tensor_to_rgb_image(pred)),
-        ("abs error", tensor_to_map_image(error)),
-        ("gt log transfer", tensor_to_map_image(q_target, symmetric=True)),
-        ("model transfer", tensor_to_map_image(q_model, symmetric=True)),
+        ("INPUT source image", tensor_to_rgb_image(source)),
+        ("GT target image", tensor_to_rgb_image(target)),
+        ("MODEL prediction", tensor_to_rgb_image(pred)),
+        ("DIAG abs(pred-GT)", tensor_to_map_image(error)),
+        ("GT source->target transfer", tensor_to_map_image(q_target, symmetric=True)),
+        ("MODEL dense transfer", tensor_to_map_image(q_model, symmetric=True)),
     ]
 
 
@@ -398,6 +398,14 @@ def evaluate(args: argparse.Namespace) -> tuple[dict[str, Any], list[EvalResult]
         source_ray_cos = cosine_per_sample(source_pred["ray"], source_ray_gt)
         target_ray_cos = cosine_per_sample(target_ray_rotated, target_ray_gt)
         source_recon_mae = per_sample_mean((source_unit - pred_unit).abs())
+        source_target_mae = per_sample_mean((source_unit - target_unit).abs())
+        pred_to_target_mae = mae
+        pred_to_source_mae = source_recon_mae
+        target_closeness_margin = pred_to_source_mae - pred_to_target_mae
+        closeness = target_closeness_margin / (pred_to_source_mae + pred_to_target_mae).clamp_min(1e-6)
+        closer_to_target = (pred_to_target_mae < pred_to_source_mae).float()
+        edit_progress = pred_to_source_mae / source_target_mae.clamp_min(1e-6)
+        target_improvement = (source_target_mae - pred_to_target_mae) / source_target_mae.clamp_min(1e-6)
         dense_abs = per_sample_mean(transfer["dense_cond"].abs())
         remove_mean = per_sample_mean(torch.sigmoid(transfer["remove_logits"]))
         create_mean = per_sample_mean(torch.sigmoid(transfer["create_logits"]))
@@ -419,6 +427,14 @@ def evaluate(args: argparse.Namespace) -> tuple[dict[str, Any], list[EvalResult]
                 "source_ray_cos": float(source_ray_cos[offset].detach().cpu()),
                 "target_ray_cos": float(target_ray_cos[offset].detach().cpu()),
                 "source_recon_mae": float(source_recon_mae[offset].detach().cpu()),
+                "pred_to_target_mae": float(pred_to_target_mae[offset].detach().cpu()),
+                "pred_to_source_mae": float(pred_to_source_mae[offset].detach().cpu()),
+                "source_to_target_mae": float(source_target_mae[offset].detach().cpu()),
+                "closer_to_target": float(closer_to_target[offset].detach().cpu()),
+                "closeness": float(closeness[offset].detach().cpu()),
+                "target_closeness_margin": float(target_closeness_margin[offset].detach().cpu()),
+                "edit_progress": float(edit_progress[offset].detach().cpu()),
+                "target_improvement": float(target_improvement[offset].detach().cpu()),
                 "dense_abs": float(dense_abs[offset].detach().cpu()),
                 "remove_mean": float(remove_mean[offset].detach().cpu()),
                 "create_mean": float(create_mean[offset].detach().cpu()),
@@ -509,6 +525,7 @@ def make_summary_pages(summary: dict[str, Any], results: list[EvalResult]) -> li
             f"dataset: {summary['dataset_root']} split={summary['split']}",
             f"samples: {summary['sample_count']}   sample_steps: {summary['sample_steps']}   use_gt_source_light: {summary['use_gt_source_light']}",
             f"flow_start_mode: {summary['flow_start_mode']}   edit_noise_scale: {summary['edit_noise_scale']}",
+            "good/bad samples: ranked by closeness (+GT target, -source input)",
         ],
         70,
         y,
@@ -525,8 +542,17 @@ def make_summary_pages(summary: dict[str, Any], results: list[EvalResult]) -> li
         "psnr",
         "ssim",
         "luma_mae",
+        "pred_to_target_mae",
+        "pred_to_source_mae",
+        "source_to_target_mae",
+        "closer_to_target",
+        "closeness",
+        "target_closeness_margin",
+        "edit_progress",
+        "target_improvement",
         "transfer_l1",
         "transfer_model_l1",
+        "source_recon_mae",
         "source_ray_cos",
         "target_ray_cos",
         "dense_abs",
@@ -559,12 +585,24 @@ def make_sample_page(result: EvalResult, title: str) -> Image.Image:
         f"source_ray_cos={result.metrics['source_ray_cos']:.4f}  target_ray_cos={result.metrics['target_ray_cos']:.4f}"
     )
     draw.text((60, 90), metric_line, font=font, fill="black")
-    source_text = f"source: {result.source_meta.get('scene', '?')} {result.source_meta.get('direction', '?')} T={result.source_meta.get('temperature', '?')}"
-    target_text = f"target: {result.target_meta.get('scene', '?')} {result.target_meta.get('direction', '?')} T={result.target_meta.get('temperature', '?')}"
+    source_text = f"given source: {result.source_meta.get('scene', '?')} {result.source_meta.get('direction', '?')} T={result.source_meta.get('temperature', '?')}"
+    target_text = f"held-out GT target: {result.target_meta.get('scene', '?')} {result.target_meta.get('direction', '?')} T={result.target_meta.get('temperature', '?')}"
     draw.text((60, 125), source_text, font=small, fill="black")
     draw.text((60, 150), target_text, font=small, fill="black")
+    draw.text((60, 175), "Model input: source image + target light condition. GT target is used only for evaluation.", font=small, fill="black")
+    pred_to_target = result.metrics.get("pred_to_target_mae", result.metrics.get("mae", 0.0))
+    pred_to_source = result.metrics.get("pred_to_source_mae", result.metrics.get("source_recon_mae", 0.0))
+    source_to_target = result.metrics.get("source_to_target_mae", 0.0)
+    closer = "GT target" if result.metrics.get("closer_to_target", 0.0) >= 0.5 else "source input"
+    closeness = result.metrics.get("closeness", 0.0)
+    draw.text(
+        (60, 200),
+        f"Closeness: {closeness:+.3f} ({closer}; +GT / -source) | pred-GT={pred_to_target:.4f}, pred-source={pred_to_source:.4f}, source-GT={source_to_target:.4f}",
+        font=small,
+        fill="black",
+    )
 
-    start_x, start_y = 60, 205
+    start_x, start_y = 60, 255
     gap_x, gap_y = 35, 58
     panel_w, panel_h = 300, 300
     for i, (label, image) in enumerate(result.panels):
@@ -587,16 +625,20 @@ def write_pdf(summary: dict[str, Any], results: list[EvalResult], output: Path, 
     if not results:
         raise ValueError("No evaluation results were produced.")
     output.parent.mkdir(parents=True, exist_ok=True)
-    ordered = sorted(results, key=lambda item: item.metrics["score"])
+    ordered = sorted(
+        results,
+        key=lambda item: item.metrics.get("closeness", -item.metrics["score"]),
+        reverse=True,
+    )
     good = ordered[: max(good_count, 0)]
     good_ids = {id(item) for item in good}
     bad_candidates = [item for item in reversed(ordered) if id(item) not in good_ids]
     bad = bad_candidates[: max(bad_count, 0)]
     pages = make_summary_pages(summary, results)
     for rank, item in enumerate(good, start=1):
-        pages.append(make_sample_page(item, f"Good Sample {rank}"))
+        pages.append(make_sample_page(item, f"Good Closeness Sample {rank}"))
     for rank, item in enumerate(bad, start=1):
-        pages.append(make_sample_page(item, f"Bad Sample {rank}"))
+        pages.append(make_sample_page(item, f"Bad Closeness Sample {rank}"))
     pages[0].save(output, save_all=True, append_images=pages[1:], resolution=150.0)
     print(f"Wrote PDF report: {output}")
 

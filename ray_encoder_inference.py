@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import numpy as np
 import random
 import sys
 from dataclasses import dataclass
@@ -17,6 +18,7 @@ from omegaconf import DictConfig, OmegaConf, open_dict
 from PIL import Image, ImageDraw, ImageFont, JpegImagePlugin
 from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
+from torchvision import transforms
 
 ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
@@ -43,6 +45,15 @@ class RayEvalResult:
     confidence: float
 
 
+@dataclass
+class HeatmapContext:
+    model: torch.nn.Module
+    device: torch.device
+    image_size: int
+    alpha: float
+    target: str
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate RayEncoder and write a PDF report.")
     parser.add_argument("--checkpoint", default=None, help="Path to ray_encoder_best.pth. Defaults to latest RayEncoder run.")
@@ -58,6 +69,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--good-count", type=int, default=5)
     parser.add_argument("--bad-count", type=int, default=5)
     parser.add_argument("--device", default="auto")
+    parser.add_argument("--heatmaps", action="store_true", help="Add a separate RayEncoder gradient saliency heatmap analysis section.")
+    parser.add_argument("--heatmap-alpha", type=float, default=0.45)
+    parser.add_argument("--heatmap-target", choices=["pred", "gt"], default="pred")
+    parser.add_argument("--heatmap-scene-count", type=int, default=3)
+    parser.add_argument("--heatmap-directions-per-scene", type=int, default=8)
     return parser.parse_args()
 
 
@@ -139,6 +155,102 @@ def tensor_to_rgb_image(tensor: torch.Tensor, size: tuple[int, int] = (320, 320)
     unit = image_to_unit_range(tensor.detach().float().cpu()).clamp(0.0, 1.0)
     array = (unit.permute(1, 2, 0).numpy() * 255.0).round().astype("uint8")
     return Image.fromarray(array, mode="RGB").resize(size, Image.Resampling.BICUBIC)
+
+
+def image_transform(image_size: int) -> transforms.Compose:
+    return transforms.Compose(
+        [
+            transforms.Resize(image_size),
+            transforms.CenterCrop(image_size),
+            transforms.ToTensor(),
+            transforms.Lambda(lambda x: x * 2.0 - 1.0),
+        ]
+    )
+
+
+def load_image_tensor(path: Path, image_size: int) -> torch.Tensor | None:
+    if not path.exists():
+        return None
+    with Image.open(path) as image:
+        return image_transform(image_size)(image.convert("RGB")).unsqueeze(0).contiguous()
+
+
+def heatmap_colorize(heatmap: torch.Tensor) -> Image.Image:
+    value = torch.nan_to_num(heatmap.detach().float().cpu(), nan=0.0, posinf=0.0, neginf=0.0)
+    value = value - value.quantile(0.05)
+    value = value / value.quantile(0.95).clamp_min(1e-6)
+    value = value.clamp(0.0, 1.0).numpy()
+    red = np.full_like(value, 255.0)
+    green = np.clip(value * 220.0, 0.0, 220.0)
+    blue = np.clip((1.0 - value) * 80.0, 0.0, 80.0)
+    alpha = np.clip(value * 255.0, 0.0, 255.0)
+    rgba = np.stack([red, green, blue, alpha], axis=-1).round().astype("uint8")
+    return Image.fromarray(rgba, mode="RGBA")
+
+
+def overlay_heatmap(base: Image.Image, heatmap: torch.Tensor, alpha: float) -> Image.Image:
+    base_rgba = base.convert("RGBA")
+    color = heatmap_colorize(heatmap).resize(base_rgba.size, Image.Resampling.BICUBIC)
+    color_alpha = color.getchannel("A").point(lambda value: int(value * max(min(alpha, 1.0), 0.0)))
+    color.putalpha(color_alpha)
+    return Image.alpha_composite(base_rgba, color).convert("RGB")
+
+
+def direction_index_from_name(name: str) -> int:
+    key = name.upper()
+    if key not in DIRECTIONS:
+        return 0
+    return DIRECTIONS.index(key)
+
+
+def build_ray_encoder_model(args: argparse.Namespace, device: torch.device) -> tuple[DictConfig, torch.nn.Module]:
+    checkpoint_path = resolve_checkpoint(args.checkpoint)
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    if not isinstance(checkpoint, dict):
+        raise ValueError(f"Expected checkpoint dictionary, got {type(checkpoint).__name__}.")
+    cfg = config_from_checkpoint(checkpoint, args.config_name)
+    model = instantiate(cfg.light_encoder).to(device).eval()
+    state = checkpoint.get("light_encoder")
+    if state is None and isinstance(checkpoint.get("models"), dict):
+        state = checkpoint["models"].get("light_encoder")
+    if not isinstance(state, dict):
+        raise ValueError(f"Checkpoint does not contain RayEncoder weights: {checkpoint_path}")
+    model.load_state_dict(state, strict=False)
+    return cfg, model
+
+
+def make_heatmap_context(args: argparse.Namespace) -> HeatmapContext | None:
+    if not bool(args.heatmaps):
+        return None
+    device = select_device(args.device)
+    cfg, model = build_ray_encoder_model(args, device)
+    return HeatmapContext(
+        model=model,
+        device=device,
+        image_size=int(cfg.get("image_size", 256)),
+        alpha=float(args.heatmap_alpha),
+        target=str(args.heatmap_target),
+    )
+
+
+def ray_encoder_heatmap(result: RayEvalResult, context: HeatmapContext) -> Image.Image | None:
+    path = Path(result.image_path)
+    image_tensor = load_image_tensor(path, context.image_size)
+    if image_tensor is None:
+        return None
+    image_tensor = image_tensor.to(context.device)
+    image_tensor.requires_grad_(True)
+    context.model.zero_grad(set_to_none=True)
+    with torch.enable_grad():
+        output = context.model(image_tensor)
+        logits = output["direction_logits"].float()
+        class_index = direction_index_from_name(result.gt_direction if context.target == "gt" else result.pred_direction)
+        score = logits[:, class_index].sum()
+        grad = torch.autograd.grad(score, image_tensor, retain_graph=False, create_graph=False)[0]
+    saliency = grad.detach().abs().amax(dim=1).squeeze(0)
+    saliency = F.avg_pool2d(saliency.view(1, 1, *saliency.shape), kernel_size=9, stride=1, padding=4).squeeze(0).squeeze(0)
+    base = load_result_image(result)
+    return overlay_heatmap(base, saliency, context.alpha)
 
 
 def load_font(size: int, bold: bool = False) -> ImageFont.ImageFont:
@@ -355,6 +467,7 @@ def make_sample_page(title: str, samples: list[RayEvalResult]) -> Image.Image:
         y = 145 + row * 350
         image = load_result_image(result)
         page.paste(image, (x, y))
+        draw.text((x, y - 27), "Input image", font=small, fill="black")
         lines = [
             f"scene: {result.scene}",
             f"GT: {result.gt_direction} ({result.gt_angle:.0f} deg)",
@@ -369,16 +482,107 @@ def make_sample_page(title: str, samples: list[RayEvalResult]) -> Image.Image:
     return page
 
 
+def direction_sort_key(direction: str) -> int:
+    try:
+        return DIRECTIONS.index(direction.upper())
+    except ValueError:
+        return len(DIRECTIONS)
+
+
+def select_heatmap_scene_groups(
+    results: list[RayEvalResult],
+    scene_count: int,
+    directions_per_scene: int,
+) -> list[list[RayEvalResult]]:
+    grouped: dict[str, dict[str, RayEvalResult]] = {}
+    for result in results:
+        if not result.scene or not Path(result.image_path).exists():
+            continue
+        scene_group = grouped.setdefault(result.scene, {})
+        current = scene_group.get(result.gt_direction)
+        if current is None or result.angle_error < current.angle_error:
+            scene_group[result.gt_direction] = result
+
+    candidates = [
+        sorted(scene_group.values(), key=lambda item: direction_sort_key(item.gt_direction))
+        for scene_group in grouped.values()
+        if len(scene_group) >= 2
+    ]
+    candidates.sort(key=lambda items: (-len(items), sum(item.angle_error for item in items) / max(len(items), 1), items[0].scene))
+    selected: list[list[RayEvalResult]] = []
+    for items in candidates[: max(scene_count, 0)]:
+        selected.append(items[: max(directions_per_scene, 1)])
+    return selected
+
+
+def make_heatmap_analysis_page(
+    scene_results: list[RayEvalResult],
+    heatmap_context: HeatmapContext,
+    page_index: int,
+) -> Image.Image:
+    page = Image.new("RGB", (1800, 1200), "white")
+    draw = ImageDraw.Draw(page)
+    title_font = load_font(42, bold=True)
+    font = load_font(20)
+    small = load_font(16)
+    scene = scene_results[0].scene if scene_results else "unknown"
+    draw.text((60, 45), f"Heatmap Analysis {page_index}: scene {scene}", font=title_font, fill="black")
+    target_label = "predicted direction logit" if heatmap_context.target == "pred" else "ground-truth direction logit"
+    draw.text(
+        (60, 95),
+        f"Each panel is the same scene under a different GT light direction. Heatmap target: {target_label}.",
+        font=font,
+        fill="dimgray",
+    )
+
+    cell_w = 420
+    cell_h = 505
+    image_size = (300, 300)
+    start_x = 60
+    start_y = 155
+    for i, result in enumerate(scene_results[:8]):
+        row = i // 4
+        col = i % 4
+        x = start_x + col * cell_w
+        y = start_y + row * cell_h
+        heatmap_image = ray_encoder_heatmap(result, heatmap_context)
+        image = heatmap_image if heatmap_image is not None else load_result_image(result)
+        image = image.resize(image_size, Image.Resampling.BICUBIC)
+        page.paste(image, (x, y))
+        draw.rectangle((x, y, x + image_size[0], y + image_size[1]), outline="black", width=2)
+        lines = [
+            f"GT: {result.gt_direction} ({result.gt_angle:.0f} deg)",
+            f"Pred: {result.pred_direction} ({result.pred_angle:.1f} deg)",
+            f"error: {result.angle_error:.1f} deg",
+            f"cos: {result.ray_cosine:.4f}  conf: {result.confidence:.3f}",
+        ]
+        draw_lines(draw, lines, x, y + image_size[1] + 12, font)
+        draw.text((x, y + image_size[1] + 122), Path(result.image_path).name[:42], font=small, fill="dimgray")
+    return page
+
+
 def write_outputs(summary: dict[str, Any], results: list[RayEvalResult], args: argparse.Namespace) -> None:
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     best = sorted(results, key=lambda item: item.angle_error)[: max(int(args.good_count), 0)]
     worst = sorted(results, key=lambda item: item.angle_error, reverse=True)[: max(int(args.bad_count), 0)]
+    heatmap_context = make_heatmap_context(args)
+    heatmap_groups = (
+        select_heatmap_scene_groups(
+            results,
+            scene_count=int(args.heatmap_scene_count),
+            directions_per_scene=int(args.heatmap_directions_per_scene),
+        )
+        if heatmap_context is not None
+        else []
+    )
     pages = [make_summary_page(summary)]
     if best:
         pages.append(make_sample_page(f"Best {len(best)} Samples by Angular Error", best))
     if worst:
         pages.append(make_sample_page(f"Worst {len(worst)} Samples by Angular Error", worst))
+    for index, group in enumerate(heatmap_groups, start=1):
+        pages.append(make_heatmap_analysis_page(group, heatmap_context, page_index=index))
     pages[0].save(output_path, save_all=True, append_images=pages[1:])
     print(f"Wrote RayEncoder PDF report: {output_path}")
 
@@ -387,6 +591,20 @@ def write_outputs(summary: dict[str, Any], results: list[RayEvalResult], args: a
         "summary": summary,
         "best": [result.__dict__ for result in best],
         "worst": [result.__dict__ for result in worst],
+        "heatmaps": {
+            "enabled": bool(args.heatmaps),
+            "target": str(args.heatmap_target),
+            "alpha": float(args.heatmap_alpha),
+            "scene_count": len(heatmap_groups),
+            "scenes": [
+                {
+                    "scene": group[0].scene,
+                    "directions": [item.gt_direction for item in group],
+                    "indices": [item.index for item in group],
+                }
+                for group in heatmap_groups
+            ],
+        },
     }
     metrics_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     print(f"Wrote RayEncoder metrics: {metrics_path}")

@@ -429,6 +429,12 @@ class CPLightSiTTrainer(Trainer):
     def _edit_noise_scale(self) -> float:
         return max(float(self.config.get("edit_noise_scale", 0.0)), 0.0)
 
+    def _source_tokens_condition(self, source_tokens: torch.Tensor) -> torch.Tensor | None:
+        model_cfg = self.config.get("model", {})
+        if bool(model_cfg.get("use_source_tokens", True)):
+            return source_tokens
+        return None
+
     def _ray_pretrain_loss(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         batch = self._move_tensor_batch(batch)  # type: ignore[assignment]
         source_image = batch["source_image"]
@@ -591,7 +597,12 @@ class CPLightSiTTrainer(Trainer):
             transfer = self.light_transfer_transformer(source_image, source_light_used, target_light_rotated, physics)
             dense_cond = transfer["dense_cond"].detach() if bool(self.config.get("detach_dense_cond_from_flow", False)) else transfer["dense_cond"]
             light_cond = torch.cat([source_light_used, target_light_rotated, target_light_rotated - source_light_used], dim=1)
-            cond = {"y": y, "light_cond": light_cond, "dense_cond": dense_cond, "source_tokens": source_tokens}
+            cond = {
+                "y": y,
+                "light_cond": light_cond,
+                "dense_cond": dense_cond,
+                "source_tokens": self._source_tokens_condition(source_tokens),
+            }
             flow_loss_dict = self.diffusion(
                 x=target_tokens,
                 cond=cond,
