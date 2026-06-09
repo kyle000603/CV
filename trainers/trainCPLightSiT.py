@@ -77,9 +77,18 @@ class CPLightSiTTrainer(Trainer):
         self._setup_amp()
 
     def _condition_adapter_module_names(self, model: nn.Module) -> list[str]:
-        names = list(self._CROSS_ATTENTION_CONDITION_MODULES)
+        use_source_tokens = bool(getattr(model, "use_source_tokens", True))
+        names = [
+            name
+            for name in self._CROSS_ATTENTION_CONDITION_MODULES
+            if use_source_tokens or name != "cross_source_proj"
+        ]
         if bool(getattr(model, "use_additive_condition", True)):
-            names.extend(self._ADDITIVE_CONDITION_MODULES)
+            names.extend(
+                name
+                for name in self._ADDITIVE_CONDITION_MODULES
+                if use_source_tokens or name != "source_proj"
+            )
         return names
 
     def _setup_amp(self) -> None:
