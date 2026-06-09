@@ -52,6 +52,7 @@ class CPLightSiT(DiT):
         light_drop_prob: float = 0.0,
         dense_drop_prob: float = 0.0,
         source_drop_prob: float = 0.0,
+        use_additive_condition: bool = True,
         use_cross_attention_condition: bool = True,
         cross_attention_layers: int = 2,
         cross_attention_heads: Optional[int] = None,
@@ -67,6 +68,7 @@ class CPLightSiT(DiT):
         self.light_drop_prob = light_drop_prob
         self.dense_drop_prob = dense_drop_prob
         self.source_drop_prob = source_drop_prob
+        self.use_additive_condition = use_additive_condition
         self.use_cross_attention_condition = use_cross_attention_condition
         self.cross_attention_layers = max(int(cross_attention_layers), 0)
         self.light_mlp = nn.Sequential(nn.Linear(light_dim, self.hidden_size), nn.SiLU(), nn.Linear(self.hidden_size, self.hidden_size))
@@ -183,16 +185,16 @@ class CPLightSiT(DiT):
         h = self.x_embedder(x) + self._pos_embed(token_count, x.device, x.dtype)
         c = self._condition(t, y)
 
-        if light_cond is not None:
+        if self.use_additive_condition and light_cond is not None:
             light = self._drop_condition(light_cond.to(device=x.device, dtype=x.dtype), self.light_drop_prob)
             c = c + self.light_mlp(light.float()).to(dtype=c.dtype)
 
-        if self.use_dense_condition and dense_cond is not None:
+        if self.use_additive_condition and self.use_dense_condition and dense_cond is not None:
             dense = self._drop_condition(dense_cond.to(device=x.device, dtype=x.dtype), self.dense_drop_prob)
             dense_tokens = self._dense_to_tokens(dense, token_count, x.dtype)
             h = h + self.dense_proj(dense_tokens.float()).to(dtype=h.dtype)
 
-        if self.use_source_tokens and source_tokens is not None:
+        if self.use_additive_condition and self.use_source_tokens and source_tokens is not None:
             source = self._drop_condition(source_tokens.to(device=x.device, dtype=x.dtype), self.source_drop_prob)
             h = h + self.source_proj(source.float()).to(dtype=h.dtype)
 

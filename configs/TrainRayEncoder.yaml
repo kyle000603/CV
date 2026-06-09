@@ -9,7 +9,7 @@ loss_mode: minimal
 
 result_name: RayEncoder
 epochs: 50
-batch_size: 1024
+batch_size: 256
 num_workers: 24
 log_every: 50
 save_every: 1
@@ -97,9 +97,16 @@ dataset:
     track1_temperature: 5500
 
 light_encoder:
-  hidden_dim: 512
+  hidden_dim: 768
   light_dim: 3
   extended: false
+  image_size: ${image_size}
+  patch_size: 16
+  depth: 12
+  num_heads: 12
+  mlp_ratio: 4.0
+  dropout: 0.0
+  direction_count: 8
 
 freeze_backbone: true
 freeze_ray_encoder: false
@@ -111,12 +118,9 @@ train_light_transfer_transformer: false
 lambda_flow: 0.0
 lambda_transfer: 0.0
 lambda_light_encoder: 1.0
-lambda_ray_direct: 1.0
-lambda_ray_direction_ce: 0.25
-lambda_ray_reference: 0.5
-lambda_ray_physics: 0.1
-lambda_ray_temperature: 0.05
-ray_direction_ce_temperature: 0.07
+lambda_ray_direction_cls: 1.0
+lambda_ray_rotation_consistency: 0.5
+lambda_ray_physics_transfer: 0.1
 ray_physics_q_clip: 2.0
 ray_physics_smooth_l1_beta: 0.1
 

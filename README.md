@@ -113,7 +113,7 @@ The sanity script creates a temporary VIDIT-like batch, disables automatic downl
 
 ## Training
 
-The recommended workflow has two stages.
+The recommended workflow has two stages, each with a 6-run hyperparameter sweep.
 
 To run both stages in order with DDP, use:
 
@@ -121,16 +121,44 @@ To run both stages in order with DDP, use:
 CUDA_DEVICES=0,1,2,3 NPROC_PER_NODE=4 ./train.sh
 ```
 
-`train.sh` first runs `TrainRayEncoder`, reads `checkpoint/latest_RayEncoder.txt`, then starts `TrainCPLightSiT_Minimal` with the freshly saved `ray_encoder_best.pth`.
+`train.sh` runs `train_encoder.sh` first, which launches 6 `TrainRayEncoder` DDP runs with different learning-rate, batch, pair-sampling, and RayEncoder loss-weight combinations. It writes all encoder sweep results to:
+
+```text
+checkpoint/encoder_sweep_runs.tsv
+```
+
+After the encoder sweep finishes, `train.sh` selects the RayEncoder checkpoint with the lowest saved validation score, stores a stable copy at:
+
+```text
+checkpoint/best_RayEncoder/ray_encoder_best.pth
+checkpoint/best_RayEncoder/best_ray_encoder.json
+```
+
+Then `train.sh` passes that selected RayEncoder into `train_diffusion.sh`, which launches 6 `TrainCPLightSiT_Minimal` DDP fine-tuning runs with different learning-rate, transfer-loss, source-light mixing, and batch-size combinations. Diffusion sweep results are written to:
+
+```text
+checkpoint/diffusion_sweep_runs.tsv
+```
+
+You can also run each stage separately:
+
+```bash
+CUDA_DEVICES=0,1,2,3 NPROC_PER_NODE=4 ./train_encoder.sh
+
+RAY_CHECKPOINT=checkpoint/best_RayEncoder/ray_encoder_best.pth \
+CUDA_DEVICES=0,1,2,3 NPROC_PER_NODE=4 ./train_diffusion.sh
+```
 
 Stage-specific overrides can be passed through `RAY_ARGS` and `SIT_ARGS`:
 
 ```bash
 CUDA_DEVICES=0,1,2,3 NPROC_PER_NODE=4 \
-RAY_ARGS="epochs=3 batch_size=1024 dataloader.global_batch_size=1024" \
+RAY_ARGS="epochs=3 batch_size=256 dataloader.global_batch_size=256" \
 SIT_ARGS="epochs=5 batch_size=128 dataloader.global_batch_size=128 dataset.train.max_pairs_per_scene=8 dataset.val.max_pairs_per_scene=8" \
 ./train.sh
 ```
+
+The sweep scripts intentionally apply each run's hyperparameter combination after shared stage overrides, so use `RAY_ARGS` and `SIT_ARGS` mainly for shared settings such as `epochs`, dataset limits, debug flags, or asset toggles.
 
 For fast DDP startup, `train.py` prepares VIDIT metadata manifests before DDP setup. Existing Hugging Face VIDIT conversions get `train/metadata.json` and `val/metadata.json` generated once, so each rank avoids recursive directory scans.
 
@@ -139,11 +167,11 @@ Stage 1 pretrains the RayEncoder on VIDIT illumination labels:
 ```bash
 python train.py -cn TrainRayEncoder \
   epochs=50 \
-  batch_size=1024 \
-  dataloader.global_batch_size=1024
+  batch_size=256 \
+  dataloader.global_batch_size=256
 ```
 
-RayEncoder pretraining uses reference pairs from `VIDITRelightingDataset`. Each batch contains a source image and a same-scene reference/target image, so the encoder is trained with direct source/target ray supervision, 8-way direction cross-entropy, source-to-reference rotation consistency, and a physics loss that compares predicted Lambertian log-shading transfer against the observed source/reference log-luminance transfer. The paired dataset preloads unique transformed VIDIT images into RAM before the first epoch, so the training loop consumes memory-resident tensors instead of repeatedly decoding images from disk.
+RayEncoder pretraining uses a ViT-B/16 light encoder and reference pairs from `VIDITRelightingDataset`. Each batch contains a source image and a same-scene reference/target image, so the encoder is trained with three stable losses: 8-way direction classification, source-to-reference rotation consistency, and a physics loss that compares predicted Lambertian log-shading transfer against the observed source/reference log-luminance transfer. The paired dataset preloads unique transformed VIDIT images into RAM before the first epoch, so the training loop consumes memory-resident tensors instead of repeatedly decoding images from disk.
 
 Multi-GPU RayEncoder pretraining uses the same single `train.py` entrypoint:
 
@@ -207,7 +235,7 @@ L_total = L_flow + lambda_transfer * L_transfer
 
 Fine-tuning defaults freeze most of the pretrained SiT backbone and train the condition adapters, condition cross-attention blocks, `LightTransferTransformer`, plus a low-LR diffusion subset: `x_embedder`, the last 4 DiT blocks, and `final_layer`. `RayEncoder` and the pretrained VAE tokenizer are frozen by default. If `freeze_backbone=true`, a pretrained checkpoint must be loaded unless `allow_freeze_without_pretrain=true` is set explicitly.
 
-Default A100 4-GPU batches are `1024` for reference-pair RayEncoder pretraining and `128` for CP-LightSiT finetuning. RayEncoder computes source/reference images plus physics transfer, so this is intentionally lower than the old single-image setting. If CP-LightSiT memory is tight, lower it to `64`.
+Default A100 4-GPU batches are `256` for ViT-B reference-pair RayEncoder pretraining and `128` for CP-LightSiT finetuning. RayEncoder computes source/reference images plus physics transfer, so this is intentionally lower than the old single-image setting. If CP-LightSiT memory is tight, lower it to `64`.
 
 RayEncoder quality can be inspected separately:
 
@@ -220,7 +248,7 @@ python ray_encoder_inference.py \
   --output ray_encoder_report.pdf
 ```
 
-The RayEncoder report includes 8-way direction accuracy, ray cosine, angular error, temperature error, a confusion matrix, and the best/worst examples by angular error.
+The RayEncoder report includes 8-way direction accuracy, ray cosine, angular error, confidence, a confusion matrix, and the best/worst examples by angular error.
 
 Equivalent explicit command:
 
@@ -268,7 +296,7 @@ The report includes MAE, MSE, RMSE, PSNR, SSIM, luminance MAE, log-transfer L1, 
 
 ## Components
 
-- `RayEncoder`: small ConvNet that predicts a normalized 3D source light ray, projected azimuth direction, temperature, and confidence.
+- `RayEncoder`: ViT-B/16 light encoder that predicts 8-way light-direction logits, converts them into a normalized 3D source light ray, and reports confidence from the direction distribution.
 - `PhysicsLightTransfer`: directional-light shading prior using depth-derived normals, ambient light, log-shading transfer, and a pixel-wise light-effect field.
 - `LightTransferTransformer`: patch transformer that refines dense light transfer and outputs an 18-channel dense condition.
 - `CPLightSiT`: token-space DiT with global light condition, dense condition, and source-token injection.

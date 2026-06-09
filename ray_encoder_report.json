@@ -1,0 +1,269 @@
+{
+  "summary": {
+    "checkpoint": "checkpoint/001_RayEncoder/checkpoint/ray_encoder_best.pth",
+    "split": "val",
+    "dataset_root": "data/VIDIT_HF",
+    "sample_count": 1200,
+    "accuracy_8way": 0.47333332896232605,
+    "ray_cosine": {
+      "mean": 0.8739186525344849,
+      "median": 0.9348204731941223,
+      "p10": 0.6568205952644348,
+      "p90": 0.992000162601471
+    },
+    "angle_error_deg": {
+      "mean": 34.722267150878906,
+      "median": 24.05877685546875,
+      "p10": 3.4287827014923096,
+      "p90": 83.47565460205078
+    },
+    "temperature_error": {
+      "mean": 0.17182831466197968,
+      "median": 0.18076422810554504,
+      "p10": 0.027491062879562378,
+      "p90": 0.31174519658088684
+    },
+    "confidence": {
+      "mean": 0.48890671133995056,
+      "median": 0.489202618598938,
+      "p10": 0.48341333866119385,
+      "p90": 0.4938034117221832
+    },
+    "confusion": [
+      [
+        83,
+        36,
+        3,
+        0,
+        6,
+        4,
+        3,
+        15
+      ],
+      [
+        15,
+        89,
+        26,
+        5,
+        5,
+        5,
+        0,
+        5
+      ],
+      [
+        4,
+        9,
+        94,
+        27,
+        1,
+        5,
+        5,
+        5
+      ],
+      [
+        0,
+        0,
+        35,
+        80,
+        20,
+        5,
+        10,
+        0
+      ],
+      [
+        0,
+        0,
+        5,
+        48,
+        70,
+        17,
+        10,
+        0
+      ],
+      [
+        1,
+        0,
+        1,
+        18,
+        51,
+        41,
+        33,
+        5
+      ],
+      [
+        7,
+        3,
+        0,
+        0,
+        19,
+        32,
+        63,
+        26
+      ],
+      [
+        39,
+        10,
+        6,
+        1,
+        6,
+        6,
+        34,
+        48
+      ]
+    ]
+  },
+  "best": [
+    {
+      "index": 592,
+      "image_path": "data/VIDIT_HF/val/Image013_SW_3500.png",
+      "scene": "Image013",
+      "gt_direction": "SW",
+      "pred_direction": "SW",
+      "gt_angle": 225.0,
+      "pred_angle": 225.0149688720703,
+      "angle_error": 0.0149688720703125,
+      "ray_cosine": 0.9995300769805908,
+      "gt_temperature": -0.800000011920929,
+      "pred_temperature": -0.8244336843490601,
+      "temp_error": 0.024433672428131104,
+      "confidence": 0.49002736806869507
+    },
+    {
+      "index": 396,
+      "image_path": "data/VIDIT_HF/val/Image143_W_6500.png",
+      "scene": "Image143",
+      "gt_direction": "W",
+      "pred_direction": "W",
+      "gt_angle": 270.0,
+      "pred_angle": 270.1166687011719,
+      "angle_error": 0.116668701171875,
+      "ray_cosine": 0.9823617339134216,
+      "gt_temperature": 0.4000000059604645,
+      "pred_temperature": 0.6010779142379761,
+      "temp_error": 0.2010779082775116,
+      "confidence": 0.4859609305858612
+    },
+    {
+      "index": 630,
+      "image_path": "data/VIDIT_HF/val/Image013_NE_2500.png",
+      "scene": "Image013",
+      "gt_direction": "NE",
+      "pred_direction": "NE",
+      "gt_angle": 45.0,
+      "pred_angle": 44.880104064941406,
+      "angle_error": 0.119903564453125,
+      "ray_cosine": 0.9500554203987122,
+      "gt_temperature": -1.2000000476837158,
+      "pred_temperature": -0.9780515432357788,
+      "temp_error": 0.221948504447937,
+      "confidence": 0.4942692816257477
+    },
+    {
+      "index": 1135,
+      "image_path": "data/VIDIT_HF/val/Image184_N_5500.png",
+      "scene": "Image184",
+      "gt_direction": "N",
+      "pred_direction": "N",
+      "gt_angle": 0.0,
+      "pred_angle": 359.8695983886719,
+      "angle_error": 0.13037109375,
+      "ray_cosine": 0.9941908121109009,
+      "gt_temperature": 0.0,
+      "pred_temperature": 0.01404825784265995,
+      "temp_error": 0.01404825784265995,
+      "confidence": 0.4928731322288513
+    },
+    {
+      "index": 1019,
+      "image_path": "data/VIDIT_HF/val/Image079_S_3500.png",
+      "scene": "Image079",
+      "gt_direction": "S",
+      "pred_direction": "S",
+      "gt_angle": 180.0,
+      "pred_angle": 180.16134643554688,
+      "angle_error": 0.161346435546875,
+      "ray_cosine": 0.9997541904449463,
+      "gt_temperature": -0.800000011920929,
+      "pred_temperature": -0.7602803111076355,
+      "temp_error": 0.03971970081329346,
+      "confidence": 0.4810301661491394
+    }
+  ],
+  "worst": [
+    {
+      "index": 800,
+      "image_path": "data/VIDIT_HF/val/Image003_NE_5500.png",
+      "scene": "Image003",
+      "gt_direction": "NE",
+      "pred_direction": "SW",
+      "gt_angle": 45.0,
+      "pred_angle": 225.0959014892578,
+      "angle_error": 179.90411376953125,
+      "ray_cosine": 0.5432583093643188,
+      "gt_temperature": 0.0,
+      "pred_temperature": -0.13853342831134796,
+      "temp_error": 0.13853342831134796,
+      "confidence": 0.49054190516471863
+    },
+    {
+      "index": 1148,
+      "image_path": "data/VIDIT_HF/val/Image003_N_3500.png",
+      "scene": "Image003",
+      "gt_direction": "N",
+      "pred_direction": "S",
+      "gt_angle": 0.0,
+      "pred_angle": 182.1171417236328,
+      "angle_error": 177.88287353515625,
+      "ray_cosine": 0.35842016339302063,
+      "gt_temperature": -0.800000011920929,
+      "pred_temperature": -0.8548476696014404,
+      "temp_error": 0.054847657680511475,
+      "confidence": 0.4917430877685547
+    },
+    {
+      "index": 31,
+      "image_path": "data/VIDIT_HF/val/Image088_E_3500.png",
+      "scene": "Image088",
+      "gt_direction": "E",
+      "pred_direction": "W",
+      "gt_angle": 90.0,
+      "pred_angle": 267.626708984375,
+      "angle_error": 177.626708984375,
+      "ray_cosine": 0.369189977645874,
+      "gt_temperature": -0.800000011920929,
+      "pred_temperature": -0.9257792234420776,
+      "temp_error": 0.12577921152114868,
+      "confidence": 0.4883904457092285
+    },
+    {
+      "index": 79,
+      "image_path": "data/VIDIT_HF/val/Image088_E_4500.png",
+      "scene": "Image088",
+      "gt_direction": "E",
+      "pred_direction": "W",
+      "gt_angle": 90.0,
+      "pred_angle": 272.7803039550781,
+      "angle_error": 177.21969604492188,
+      "ray_cosine": 0.3956943154335022,
+      "gt_temperature": -0.4000000059604645,
+      "pred_temperature": -0.6524741649627686,
+      "temp_error": 0.2524741590023041,
+      "confidence": 0.4875308573246002
+    },
+    {
+      "index": 135,
+      "image_path": "data/VIDIT_HF/val/Image088_E_5500.png",
+      "scene": "Image088",
+      "gt_direction": "E",
+      "pred_direction": "W",
+      "gt_angle": 90.0,
+      "pred_angle": 273.2689208984375,
+      "angle_error": 176.7310791015625,
+      "ray_cosine": 0.4227866530418396,
+      "gt_temperature": 0.0,
+      "pred_temperature": -0.21993646025657654,
+      "temp_error": 0.21993646025657654,
+      "confidence": 0.4869433343410492
+    }
+  ]
+}

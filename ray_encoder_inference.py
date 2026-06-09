@@ -40,9 +40,6 @@ class RayEvalResult:
     pred_angle: float
     angle_error: float
     ray_cosine: float
-    gt_temperature: float
-    pred_temperature: float
-    temp_error: float
     confidence: float
 
 
@@ -221,14 +218,12 @@ def evaluate(args: argparse.Namespace) -> tuple[dict[str, Any], list[RayEvalResu
     confusion = torch.zeros(len(DIRECTIONS), len(DIRECTIONS), dtype=torch.int64)
     ray_cosines: list[torch.Tensor] = []
     angle_errors: list[torch.Tensor] = []
-    temp_errors: list[torch.Tensor] = []
     confidences: list[torch.Tensor] = []
     correct: list[torch.Tensor] = []
 
     for batch_id, raw_batch in enumerate(tqdm(dataloader, desc="Evaluating RayEncoder", dynamic_ncols=True)):
         image = raw_batch["source_image"].to(device, non_blocking=True)
         gt_ray = raw_batch["source_ray"].to(device, non_blocking=True).float()
-        gt_light = raw_batch["source_light"].to(device, non_blocking=True).float()
         gt_angle = raw_batch["source_angle"].to(device, non_blocking=True).float()
         pred = model(image)
         pred_ray = F.normalize(pred["ray"].float(), dim=1, eps=1e-6)
@@ -236,7 +231,6 @@ def evaluate(args: argparse.Namespace) -> tuple[dict[str, Any], list[RayEvalResu
         ray_cos = (pred_ray * gt_ray).sum(dim=1).clamp(-1.0, 1.0)
         pred_angle = torch.rad2deg(torch.atan2(pred_ray[:, 1], pred_ray[:, 0])) % 360.0
         angle_error = circular_abs_error(pred_angle, gt_angle)
-        temp_error = (pred["temperature"].float() - gt_light[:, 2:3]).abs().flatten()
         pred_idx = nearest_direction(pred_angle)
         gt_idx = nearest_direction(gt_angle)
         is_correct = pred_idx == gt_idx
@@ -244,7 +238,6 @@ def evaluate(args: argparse.Namespace) -> tuple[dict[str, Any], list[RayEvalResu
 
         ray_cosines.append(ray_cos.detach().cpu())
         angle_errors.append(angle_error.detach().cpu())
-        temp_errors.append(temp_error.detach().cpu())
         confidences.append(confidence.detach().cpu())
         correct.append(is_correct.float().detach().cpu())
 
@@ -267,16 +260,12 @@ def evaluate(args: argparse.Namespace) -> tuple[dict[str, Any], list[RayEvalResu
                     pred_angle=float(pred_angle[offset].detach().cpu()),
                     angle_error=float(angle_error[offset].detach().cpu()),
                     ray_cosine=float(ray_cos[offset].detach().cpu()),
-                    gt_temperature=float(gt_light[offset, 2].detach().cpu()),
-                    pred_temperature=float(pred["temperature"][offset, 0].detach().cpu()),
-                    temp_error=float(temp_error[offset].detach().cpu()),
                     confidence=float(confidence[offset].detach().cpu()),
                 )
             )
 
     ray_tensor = torch.cat(ray_cosines)
     angle_tensor = torch.cat(angle_errors)
-    temp_tensor = torch.cat(temp_errors)
     confidence_tensor = torch.cat(confidences)
     correct_tensor = torch.cat(correct)
     summary = {
@@ -287,7 +276,6 @@ def evaluate(args: argparse.Namespace) -> tuple[dict[str, Any], list[RayEvalResu
         "accuracy_8way": float(correct_tensor.mean()),
         "ray_cosine": summarize(ray_tensor),
         "angle_error_deg": summarize(angle_tensor),
-        "temperature_error": summarize(temp_tensor),
         "confidence": summarize(confidence_tensor),
         "confusion": confusion.tolist(),
     }
@@ -338,7 +326,6 @@ def make_summary_page(summary: dict[str, Any]) -> Image.Image:
     draw.text((70, 55), "RayEncoder Evaluation Report", font=title_font, fill="black")
     ray = summary["ray_cosine"]
     angle = summary["angle_error_deg"]
-    temp = summary["temperature_error"]
     conf = summary["confidence"]
     lines = [
         f"Checkpoint: {summary['checkpoint']}",
@@ -346,7 +333,6 @@ def make_summary_page(summary: dict[str, Any]) -> Image.Image:
         f"8-way direction accuracy: {summary['accuracy_8way'] * 100:.2f}%",
         f"Ray cosine: mean {ray['mean']:.4f}, median {ray['median']:.4f}, p10 {ray['p10']:.4f}, p90 {ray['p90']:.4f}",
         f"Angular error: mean {angle['mean']:.2f} deg, median {angle['median']:.2f} deg, p90 {angle['p90']:.2f} deg",
-        f"Temperature error: mean {temp['mean']:.4f}, median {temp['median']:.4f}",
         f"Confidence: mean {conf['mean']:.4f}, median {conf['median']:.4f}",
     ]
     draw_lines(draw, lines, 70, 145, font)
@@ -375,7 +361,6 @@ def make_sample_page(title: str, samples: list[RayEvalResult]) -> Image.Image:
             f"Pred: {result.pred_direction} ({result.pred_angle:.1f} deg)",
             f"angle error: {result.angle_error:.1f} deg",
             f"ray cosine: {result.ray_cosine:.4f}",
-            f"temp pred/gt: {result.pred_temperature:.3f} / {result.gt_temperature:.3f}",
             f"confidence: {result.confidence:.3f}",
         ]
         draw_lines(draw, lines, x + 340, y + 8, font)

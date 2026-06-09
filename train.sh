@@ -1,89 +1,82 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-TORCHRUN_BIN="${TORCHRUN_BIN:-torchrun}"
-CUDA_DEVICES="${CUDA_DEVICES-0,1,2,3}"
-NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "${SCRIPT_DIR}"
+
+PYTHON_BIN="${PYTHON_BIN:-python}"
 RESULT_ROOT="${RESULT_ROOT:-checkpoint}"
-RAY_CONFIG="${RAY_CONFIG:-TrainRayEncoder}"
-SIT_CONFIG="${SIT_CONFIG:-TrainCPLightSiT_Minimal}"
-RDZV_BACKEND="${RDZV_BACKEND:-c10d}"
-RDZV_ENDPOINT="${RDZV_ENDPOINT:-localhost:0}"
+ENCODER_SWEEP_MANIFEST="${ENCODER_SWEEP_MANIFEST:-${RESULT_ROOT}/encoder_sweep_runs.tsv}"
+DIFFUSION_SWEEP_MANIFEST="${DIFFUSION_SWEEP_MANIFEST:-${RESULT_ROOT}/diffusion_sweep_runs.tsv}"
+BEST_RAY_DIR="${BEST_RAY_DIR:-${RESULT_ROOT}/best_RayEncoder}"
 
-COMMON_OVERRIDE_ARGS=()
-RAY_OVERRIDE_ARGS=()
-SIT_OVERRIDE_ARGS=()
+echo "[1/3] Running 6 RayEncoder hyperparameter sweeps"
+ENCODER_SWEEP_MANIFEST="${ENCODER_SWEEP_MANIFEST}" ./train_encoder.sh
 
-if [[ -n "${COMMON_OVERRIDES:-}" ]]; then
-  read -r -a COMMON_OVERRIDE_ARGS <<< "${COMMON_OVERRIDES}"
-fi
-if [[ -n "${RAY_ARGS:-}" ]]; then
-  read -r -a RAY_OVERRIDE_ARGS <<< "${RAY_ARGS}"
-elif [[ -n "${RAY_OVERRIDES:-}" ]]; then
-  read -r -a RAY_OVERRIDE_ARGS <<< "${RAY_OVERRIDES}"
-fi
-if [[ -n "${SIT_ARGS:-}" ]]; then
-  read -r -a SIT_OVERRIDE_ARGS <<< "${SIT_ARGS}"
-elif [[ -n "${SIT_OVERRIDES:-}" ]]; then
-  read -r -a SIT_OVERRIDE_ARGS <<< "${SIT_OVERRIDES}"
-fi
+echo "[2/3] Selecting best RayEncoder checkpoint"
+read -r BEST_RAY_CHECKPOINT BEST_RAY_SCORE BEST_RAY_RUN_DIR < <(
+  "${PYTHON_BIN}" - "${ENCODER_SWEEP_MANIFEST}" "${BEST_RAY_DIR}" <<'PY'
+import csv
+import json
+import os
+import shutil
+import sys
+from pathlib import Path
 
-normalize_overrides() {
-  local -n values_ref="$1"
-  local value
-  for i in "${!values_ref[@]}"; do
-    value="${values_ref[$i]}"
-    case "${value}" in
-      +dataset.train.max_pairs_per_scene=*|+dataset.val.max_pairs_per_scene=*|+dataset.test.max_pairs_per_scene=*)
-        values_ref[$i]="${value#+}"
-        ;;
-    esac
-  done
+manifest = Path(sys.argv[1])
+best_dir = Path(sys.argv[2])
+if not manifest.exists():
+    raise SystemExit(f"encoder sweep manifest does not exist: {manifest}")
+
+rows = []
+with manifest.open("r", encoding="utf-8", newline="") as handle:
+    reader = csv.reader(handle, delimiter="\t")
+    for row in reader:
+        if len(row) < 5:
+            continue
+        run_id, score, run_dir, checkpoint, overrides = row[:5]
+        path = Path(checkpoint)
+        if path.exists():
+            rows.append(
+                {
+                    "run_id": run_id,
+                    "score": float(score),
+                    "run_dir": run_dir,
+                    "checkpoint": str(path),
+                    "overrides": overrides,
+                }
+            )
+if not rows:
+    raise SystemExit(f"no valid RayEncoder checkpoints found in {manifest}")
+
+best = min(rows, key=lambda item: item["score"])
+best_dir.mkdir(parents=True, exist_ok=True)
+target = best_dir / "ray_encoder_best.pth"
+target.unlink(missing_ok=True)
+source = Path(best["checkpoint"])
+try:
+    os.link(source, target)
+except OSError:
+    shutil.copy2(source, target)
+
+metadata = {
+    "selected": best,
+    "all_runs": rows,
+    "checkpoint": str(target),
 }
+(best_dir / "best_ray_encoder.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+print(str(target), best["score"], best["run_dir"])
+PY
+)
 
-normalize_overrides COMMON_OVERRIDE_ARGS
-normalize_overrides RAY_OVERRIDE_ARGS
-normalize_overrides SIT_OVERRIDE_ARGS
+echo "Selected RayEncoder:"
+echo "  checkpoint: ${BEST_RAY_CHECKPOINT}"
+echo "  score: ${BEST_RAY_SCORE}"
+echo "  source run: ${BEST_RAY_RUN_DIR}"
+echo "  metadata: ${BEST_RAY_DIR}/best_ray_encoder.json"
 
-run_ddp() {
-  local config_name="$1"
-  shift
-  CUDA_VISIBLE_DEVICES="${CUDA_DEVICES}" "${TORCHRUN_BIN}" \
-    --rdzv-backend="${RDZV_BACKEND}" \
-    --rdzv-endpoint="${RDZV_ENDPOINT}" \
-    --nproc_per_node="${NPROC_PER_NODE}" \
-    train.py -cn "${config_name}" "$@"
-}
+echo "[3/3] Running 6 CP-LightSiT diffusion fine-tuning sweeps"
+RAY_CHECKPOINT="${BEST_RAY_CHECKPOINT}" DIFFUSION_SWEEP_MANIFEST="${DIFFUSION_SWEEP_MANIFEST}" ./train_diffusion.sh
 
-echo "[1/2] Pretraining RayEncoder with DDP"
-run_ddp "${RAY_CONFIG}" \
-  "result_root=${RESULT_ROOT}" \
-  "${COMMON_OVERRIDE_ARGS[@]}" \
-  "${RAY_OVERRIDE_ARGS[@]}"
-
-RAY_POINTER="${RESULT_ROOT}/latest_RayEncoder.txt"
-if [[ ! -f "${RAY_POINTER}" ]]; then
-  echo "RayEncoder latest pointer was not created: ${RAY_POINTER}" >&2
-  exit 1
-fi
-
-RAY_RUN_DIR="$(tr -d '[:space:]' < "${RAY_POINTER}")"
-RAY_CHECKPOINT="${RAY_RUN_DIR}/checkpoint/ray_encoder_best.pth"
-if [[ ! -f "${RAY_CHECKPOINT}" ]]; then
-  echo "RayEncoder checkpoint was not created: ${RAY_CHECKPOINT}" >&2
-  exit 1
-fi
-
-echo "[2/2] Finetuning CP-LightSiT with DDP"
-run_ddp "${SIT_CONFIG}" \
-  "result_root=${RESULT_ROOT}" \
-  "ray_encoder_checkpoint=${RAY_CHECKPOINT}" \
-  "${COMMON_OVERRIDE_ARGS[@]}" \
-  "${SIT_OVERRIDE_ARGS[@]}"
-
-SIT_POINTER="${RESULT_ROOT}/latest_CPLightSiT.txt"
-if [[ -f "${SIT_POINTER}" ]]; then
-  SIT_RUN_DIR="$(tr -d '[:space:]' < "${SIT_POINTER}")"
-  echo "CP-LightSiT run: ${SIT_RUN_DIR}"
-fi
-echo "RayEncoder checkpoint: ${RAY_CHECKPOINT}"
+echo "Encoder sweep manifest: ${ENCODER_SWEEP_MANIFEST}"
+echo "Diffusion sweep manifest: ${DIFFUSION_SWEEP_MANIFEST}"

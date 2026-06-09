@@ -24,10 +24,12 @@ from trainers.utils import count_parameters, count_trainable_parameters, set_req
 
 
 class CPLightSiTTrainer(Trainer):
-    _CONDITION_ADAPTER_MODULES = [
+    _ADDITIVE_CONDITION_MODULES = [
         "light_mlp",
         "dense_proj",
         "source_proj",
+    ]
+    _CROSS_ATTENTION_CONDITION_MODULES = [
         "cross_light_proj",
         "cross_dense_proj",
         "cross_source_proj",
@@ -54,7 +56,9 @@ class CPLightSiTTrainer(Trainer):
         light_encoder = instantiate(config.light_encoder)
         models: dict[str, nn.Module] = {"model": model, "light_encoder": light_encoder}
         self.physics_light_transfer: nn.Module | None = None
-        needs_physics = self.stage != "ray_pretrain" or float(config.get("lambda_ray_physics", 0.0)) > 0.0
+        needs_physics = self.stage != "ray_pretrain" or float(
+            config.get("lambda_ray_physics_transfer", config.get("lambda_ray_physics", 0.0))
+        ) > 0.0
         if needs_physics:
             self.physics_light_transfer = instantiate(config.physics_light_transfer)
         if self.stage != "ray_pretrain":
@@ -71,6 +75,12 @@ class CPLightSiTTrainer(Trainer):
         self.diffusion = TrajectoryFlow(self.model)
         self.global_step = 0
         self._setup_amp()
+
+    def _condition_adapter_module_names(self, model: nn.Module) -> list[str]:
+        names = list(self._CROSS_ATTENTION_CONDITION_MODULES)
+        if bool(getattr(model, "use_additive_condition", True)):
+            names.extend(self._ADDITIVE_CONDITION_MODULES)
+        return names
 
     def _setup_amp(self) -> None:
         self.amp_enabled = self.device.type == "cuda" and bool(self.config.get("amp_enabled", True))
@@ -197,7 +207,7 @@ class CPLightSiTTrainer(Trainer):
         if bool(self.config.get("freeze_backbone", True)):
             set_requires_grad(model, False)
             if bool(self.config.get("train_condition_adapters_only", True)):
-                for name in self._CONDITION_ADAPTER_MODULES:
+                for name in self._condition_adapter_module_names(model):
                     module = getattr(model, name, None)
                     if isinstance(module, nn.Module):
                         set_requires_grad(module, True)
@@ -271,7 +281,7 @@ class CPLightSiTTrainer(Trainer):
         model = unwrap_model(self.models["model"])
         adapter_ids: set[int] = set()
         adapter_params: list[nn.Parameter] = []
-        for name in self._CONDITION_ADAPTER_MODULES:
+        for name in self._condition_adapter_module_names(model):
             module = getattr(model, name, None)
             if isinstance(module, nn.Module):
                 for param in module.parameters():
@@ -384,9 +394,6 @@ class CPLightSiTTrainer(Trainer):
         target = F.normalize(target_ray.float(), dim=1, eps=1e-6)
         return torch.nan_to_num((pred * target).sum(dim=1).mean())
 
-    def _ray_cosine_loss(self, pred_ray: torch.Tensor, target_ray: torch.Tensor) -> torch.Tensor:
-        return torch.nan_to_num(1.0 - self._cosine_metric(pred_ray, target_ray))
-
     def _direction_classes_from_angles(self, angles: torch.Tensor) -> torch.Tensor:
         direction_angles = torch.tensor(
             [DIRECTION_TO_ANGLE[name] for name in ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]],
@@ -396,17 +403,8 @@ class CPLightSiTTrainer(Trainer):
         delta = (angles.float().view(-1, 1) - direction_angles.view(1, -1) + 180.0) % 360.0 - 180.0
         return delta.abs().argmin(dim=1)
 
-    def _direction_ce_loss(self, pred_ray: torch.Tensor, target_angle: torch.Tensor) -> torch.Tensor:
-        direction_angles = torch.tensor(
-            [DIRECTION_TO_ANGLE[name] for name in ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]],
-            dtype=torch.float32,
-            device=pred_ray.device,
-        )
-        radians = torch.deg2rad(direction_angles)
-        canonical = torch.stack([torch.cos(radians), torch.sin(radians)], dim=1)
-        pred_dir = F.normalize(pred_ray[:, :2].float(), dim=1, eps=1e-6)
-        temperature = max(float(self.config.get("ray_direction_ce_temperature", 0.07)), 1e-4)
-        logits = pred_dir @ canonical.T / temperature
+    def _direction_ce_loss(self, pred: dict[str, torch.Tensor], target_angle: torch.Tensor) -> torch.Tensor:
+        logits = pred["direction_logits"].float()
         target = self._direction_classes_from_angles(target_angle)
         return torch.nan_to_num(F.cross_entropy(logits.float(), target))
 
@@ -440,25 +438,21 @@ class CPLightSiTTrainer(Trainer):
         self.optimizer.zero_grad(set_to_none=True)
         with self._autocast():
             source_pred = self.light_encoder(source_image)
-            source_ray_loss = self._ray_cosine_loss(source_pred["ray"], source_ray_tensor)
-            source_temp_loss = F.l1_loss(source_pred["temperature"].float(), source_light[:, 2:3].float())
             direction_ce = (
-                self._direction_ce_loss(source_pred["ray"], source_angle)
+                self._direction_ce_loss(source_pred, source_angle)
                 if torch.is_tensor(source_angle)
-                else self._zero_like(source_ray_loss)
+                else self._zero_like(source_pred["ray"])
             )
-            reference_loss = self._zero_like(source_ray_loss)
-            target_ray_loss = self._zero_like(source_ray_loss)
-            target_temp_loss = self._zero_like(source_ray_loss)
-            physics_loss = self._zero_like(source_ray_loss)
-            target_cosine = self._zero_like(source_ray_loss)
-            rotated_target_cosine = self._zero_like(source_ray_loss)
+            rotation_loss = self._zero_like(direction_ce)
+            physics_loss = self._zero_like(direction_ce)
+            target_cosine = self._zero_like(direction_ce)
+            rotated_target_cosine = self._zero_like(direction_ce)
             source_acc = (
                 self._ray_angle_accuracy(source_pred["ray"].detach(), source_angle)
                 if torch.is_tensor(source_angle)
-                else self._zero_like(source_ray_loss)
+                else self._zero_like(direction_ce)
             )
-            target_acc = self._zero_like(source_ray_loss)
+            target_acc = self._zero_like(direction_ce)
 
             has_reference = (
                 torch.is_tensor(target_image)
@@ -470,22 +464,20 @@ class CPLightSiTTrainer(Trainer):
             if has_reference:
                 target_ray_tensor = target_ray
                 target_pred = self.light_encoder(target_image)
-                target_ray_loss = self._ray_cosine_loss(target_pred["ray"], target_ray_tensor)
-                target_temp_loss = F.l1_loss(target_pred["temperature"].float(), target_light[:, 2:3].float())
                 direction_ce = 0.5 * (
-                    direction_ce + self._direction_ce_loss(target_pred["ray"], target_angle)
+                    direction_ce + self._direction_ce_loss(target_pred, target_angle)
                 )
                 rotated_source_ray = rotate_ray_z(source_pred["ray"], delta_angle)
                 rotated_target_ray = rotate_ray_z(target_pred["ray"], -delta_angle)
-                reference_loss = 0.5 * (
-                    self._ray_cosine_loss(rotated_source_ray, target_pred["ray"].detach())
-                    + self._ray_cosine_loss(rotated_target_ray, source_pred["ray"].detach())
+                rotation_loss = 0.5 * (
+                    (1.0 - self._cosine_metric(rotated_source_ray, target_pred["ray"].detach()))
+                    + (1.0 - self._cosine_metric(rotated_target_ray, source_pred["ray"].detach()))
                 )
                 target_cosine = self._cosine_metric(target_pred["ray"].detach(), target_ray_tensor)
                 rotated_target_cosine = self._cosine_metric(rotated_source_ray.detach(), target_ray_tensor)
                 target_acc = self._ray_angle_accuracy(target_pred["ray"].detach(), target_angle)
 
-                if float(self.config.get("lambda_ray_physics", 0.0)) > 0.0:
+                if float(self.config.get("lambda_ray_physics_transfer", self.config.get("lambda_ray_physics", 0.0))) > 0.0:
                     assert self.physics_light_transfer is not None
                     source_light_pred = ray_to_light(source_pred["ray"], source_pred["temperature"])
                     target_light_pred = ray_to_light(target_pred["ray"], target_pred["temperature"])
@@ -509,27 +501,19 @@ class CPLightSiTTrainer(Trainer):
                         beta=float(self.config.get("ray_physics_smooth_l1_beta", 0.1)),
                     )
 
-            ray_loss = 0.5 * (source_ray_loss + target_ray_loss) if has_reference else source_ray_loss
-            temp_loss = 0.5 * (source_temp_loss + target_temp_loss) if has_reference else source_temp_loss
             total = (
-                float(self.config.get("lambda_ray_direct", 1.0)) * ray_loss
-                + float(self.config.get("lambda_ray_direction_ce", 0.25)) * direction_ce
-                + float(self.config.get("lambda_ray_reference", 0.5)) * reference_loss
-                + float(self.config.get("lambda_ray_physics", 0.1)) * physics_loss
-                + float(self.config.get("lambda_ray_temperature", 0.05)) * temp_loss
+                float(self.config.get("lambda_ray_direction_cls", 1.0)) * direction_ce
+                + float(self.config.get("lambda_ray_rotation_consistency", 0.5)) * rotation_loss
+                + float(self.config.get("lambda_ray_physics_transfer", 0.1)) * physics_loss
             )
             total = torch.nan_to_num(total)
         self._optimizer_step(total)
         return {
             "Train/total": total.detach(),
             "Train/ray_pretrain/loss": total.detach(),
-            "Train/ray_pretrain/ray": torch.nan_to_num(ray_loss.detach()),
-            "Train/ray_pretrain/source_ray": torch.nan_to_num(source_ray_loss.detach()),
-            "Train/ray_pretrain/target_ray": torch.nan_to_num(target_ray_loss.detach()),
-            "Train/ray_pretrain/direction_ce": torch.nan_to_num(direction_ce.detach()),
-            "Train/ray_pretrain/reference": torch.nan_to_num(reference_loss.detach()),
-            "Train/ray_pretrain/physics": torch.nan_to_num(physics_loss.detach()),
-            "Train/ray_pretrain/temp": torch.nan_to_num(temp_loss.detach()),
+            "Train/ray_pretrain/direction_cls": torch.nan_to_num(direction_ce.detach()),
+            "Train/ray_pretrain/rotation_consistency": torch.nan_to_num(rotation_loss.detach()),
+            "Train/ray_pretrain/physics_transfer": torch.nan_to_num(physics_loss.detach()),
             "Train/source_ray/cosine": self._cosine_metric(source_pred["ray"].detach(), source_ray_tensor),
             "Train/target_ray/cosine": torch.nan_to_num(target_cosine.detach()),
             "Train/rotated_target_ray/cosine": torch.nan_to_num(rotated_target_cosine.detach()),

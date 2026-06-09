@@ -81,8 +81,15 @@ lambda_transfer: 0.1
 light_encoder:
   _target_: models.modules.ray_encoder.RayEncoder
   light_dim: 3
-  hidden_dim: 512
+  hidden_dim: 768
   extended: false
+  image_size: ${image_size}
+  patch_size: 16
+  depth: 12
+  num_heads: 12
+  mlp_ratio: 4.0
+  dropout: 0.0
+  direction_count: 8
 
 tokenizer:
   _target_: models.modules.vae_tokenizer.DiffusersAutoencoderTokenizer
