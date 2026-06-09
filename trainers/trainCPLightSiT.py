@@ -418,6 +418,17 @@ class CPLightSiTTrainer(Trainer):
     def _diffusion_train_kwargs(self) -> dict[str, float]:
         return dict(OmegaConf.to_container(self.config.diffusion.train, resolve=True))
 
+    def _flow_start_tokens(self, source_tokens: torch.Tensor) -> torch.Tensor | None:
+        mode = str(self.config.get("flow_start_mode", "source")).lower()
+        if mode in {"source", "edit", "editing"}:
+            return source_tokens
+        if mode in {"noise", "random", "generation"}:
+            return None
+        raise ValueError(f"Unsupported flow_start_mode='{mode}'. Expected 'source' or 'noise'.")
+
+    def _edit_noise_scale(self) -> float:
+        return max(float(self.config.get("edit_noise_scale", 0.0)), 0.0)
+
     def _ray_pretrain_loss(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         batch = self._move_tensor_batch(batch)  # type: ignore[assignment]
         source_image = batch["source_image"]
@@ -585,6 +596,8 @@ class CPLightSiTTrainer(Trainer):
                 x=target_tokens,
                 cond=cond,
                 mask=mask,
+                x0=self._flow_start_tokens(source_tokens),
+                x0_noise_scale=self._edit_noise_scale(),
                 losses=self.losses,
                 description="Train",
                 return_outputs=True,

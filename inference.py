@@ -55,6 +55,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="auto")
     parser.add_argument("--use-gt-source-light", action="store_true")
     parser.add_argument("--sample-progress", action="store_true")
+    parser.add_argument("--flow-start-mode", choices=["source", "noise"], default=None)
+    parser.add_argument("--edit-noise-scale", type=float, default=None)
     return parser.parse_args()
 
 
@@ -159,6 +161,33 @@ def autocast_context(cfg: DictConfig, device: torch.device) -> Any:
     if device.type != "cuda" or not bool(cfg.get("amp_enabled", True)):
         return nullcontext()
     return torch.autocast(device_type="cuda", dtype=resolve_amp_dtype(cfg))
+
+
+def resolve_flow_start_mode(cfg: DictConfig, arg_value: str | None) -> str:
+    mode = str(arg_value or cfg.get("flow_start_mode", "source")).lower()
+    if mode in {"source", "edit", "editing"}:
+        return "source"
+    if mode in {"noise", "random", "generation"}:
+        return "noise"
+    raise ValueError(f"Unsupported flow_start_mode='{mode}'. Expected 'source' or 'noise'.")
+
+
+def resolve_edit_noise_scale(cfg: DictConfig, arg_value: float | None) -> float:
+    value = float(cfg.get("edit_noise_scale", 0.0) if arg_value is None else arg_value)
+    return max(value, 0.0)
+
+
+def make_initial_tokens(
+    source_tokens: torch.Tensor,
+    flow_start_mode: str,
+    edit_noise_scale: float,
+) -> torch.Tensor:
+    if flow_start_mode == "noise":
+        return torch.randn_like(source_tokens)
+    z = source_tokens
+    if edit_noise_scale > 0.0:
+        z = z + edit_noise_scale * torch.randn_like(z)
+    return z
 
 
 def move_tensor_batch(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
@@ -275,6 +304,8 @@ def evaluate(args: argparse.Namespace) -> tuple[dict[str, Any], list[EvalResult]
             cfg.dataset[args.split].root = args.dataset_root
     modules = load_modules(checkpoint, cfg, device)
     flow = TrajectoryFlow(modules["model"])
+    flow_start_mode = resolve_flow_start_mode(cfg, args.flow_start_mode)
+    edit_noise_scale = resolve_edit_noise_scale(cfg, args.edit_noise_scale)
 
     dataset = make_dataset(cfg, args.split, args.dataset_root)
     sample_count = min(int(args.max_samples), len(dataset))
@@ -331,7 +362,10 @@ def evaluate(args: argparse.Namespace) -> tuple[dict[str, Any], list[EvalResult]
             )
             transfer = modules["light_transfer_transformer"](source_image, source_light_used, target_light_rotated, physics)
             source_tokens = modules["tokenizer"].encode(source_image)
-            z = torch.randn_like(source_tokens)
+            z = make_initial_tokens(source_tokens, flow_start_mode, edit_noise_scale)
+            model_dtype = next(modules["model"].parameters()).dtype
+            z = z.to(dtype=model_dtype)
+            source_tokens = source_tokens.to(dtype=model_dtype)
             light_cond = torch.cat([source_light_used, target_light_rotated, target_light_rotated - source_light_used], dim=1)
             cond = {"y": y, "light_cond": light_cond, "dense_cond": transfer["dense_cond"], "source_tokens": source_tokens}
             sampled_tokens = flow.sample(
@@ -414,6 +448,8 @@ def evaluate(args: argparse.Namespace) -> tuple[dict[str, Any], list[EvalResult]
         "sample_count": len(results),
         "sample_steps": args.num_steps or int(cfg.diffusion.inference.sample_steps),
         "use_gt_source_light": bool(args.use_gt_source_light),
+        "flow_start_mode": flow_start_mode,
+        "edit_noise_scale": edit_noise_scale,
     }
     return summary, results
 
@@ -472,6 +508,7 @@ def make_summary_pages(summary: dict[str, Any], results: list[EvalResult]) -> li
             f"checkpoint: {summary['checkpoint']}",
             f"dataset: {summary['dataset_root']} split={summary['split']}",
             f"samples: {summary['sample_count']}   sample_steps: {summary['sample_steps']}   use_gt_source_light: {summary['use_gt_source_light']}",
+            f"flow_start_mode: {summary['flow_start_mode']}   edit_noise_scale: {summary['edit_noise_scale']}",
         ],
         70,
         y,

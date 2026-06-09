@@ -43,6 +43,8 @@ class RectifiedFlow(nn.Module):
         self,
         x: torch.Tensor,
         cond: Any,
+        x0: Optional[torch.Tensor] = None,
+        x0_noise_scale: float = 0.0,
         timestep_shift: float = 0.1,
         losses: Optional[dict[str, nn.Module]] = None,
         description: str = "",
@@ -52,7 +54,11 @@ class RectifiedFlow(nn.Module):
         t = torch.rand(batch, dtype=x.dtype, device=x.device)
         t = self._shift_timestep(t, timestep_shift)
         view_shape = [batch] + [1] * (x.ndim - 1)
-        z0 = torch.randn_like(x)
+        if x0 is not None and tuple(x0.shape) != tuple(x.shape):
+            raise ValueError(f"x0 must have the same shape as x, got x0={tuple(x0.shape)} and x={tuple(x.shape)}.")
+        z0 = torch.randn_like(x) if x0 is None else x0.to(device=x.device, dtype=x.dtype)
+        if x0 is not None and float(x0_noise_scale) > 0.0:
+            z0 = z0 + float(x0_noise_scale) * torch.randn_like(z0)
         z1 = x
         zt = (1.0 - t.view(*view_shape)) * z0 + t.view(*view_shape) * z1
         ut = z1 - z0
@@ -64,7 +70,7 @@ class RectifiedFlow(nn.Module):
             prefix = description if description else "Flow"
             output = {f"{prefix}/loss": torch.nan_to_num(mse), f"{prefix}/mse": torch.nan_to_num(mse)}
         if return_outputs:
-            output.update({"model_output": model_output, "zt": zt, "t": t, "ut": ut})
+            output.update({"model_output": model_output, "z0": z0, "zt": zt, "t": t, "ut": ut})
         return output
 
     @torch.no_grad()
@@ -82,7 +88,11 @@ class RectifiedFlow(nn.Module):
     ) -> torch.Tensor:
         if mode != "euler":
             raise ValueError(f"Only Euler sampling is supported, got mode='{mode}'.")
-        x = z
+        try:
+            model_dtype = next(self.model.parameters()).dtype
+            x = z.to(dtype=model_dtype)
+        except StopIteration:
+            x = z
         steps = max(int(sample_steps), 1)
         iterator = range(steps)
         if progress:

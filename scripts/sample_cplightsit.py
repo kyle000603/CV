@@ -32,6 +32,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--output", required=True)
     parser.add_argument("--num-steps", type=int, default=None)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--flow-start-mode", choices=["source", "noise"], default=None)
+    parser.add_argument("--edit-noise-scale", type=float, default=None)
     parser.add_argument("--save-debug-maps", action="store_true")
     return parser.parse_args()
 
@@ -107,12 +109,37 @@ def _autocast_context(cfg: DictConfig, device: torch.device) -> Any:
     return torch.autocast(device_type="cuda", dtype=_resolve_amp_dtype(cfg))
 
 
+def _resolve_flow_start_mode(cfg: DictConfig, arg_value: str | None) -> str:
+    mode = str(arg_value or cfg.get("flow_start_mode", "source")).lower()
+    if mode in {"source", "edit", "editing"}:
+        return "source"
+    if mode in {"noise", "random", "generation"}:
+        return "noise"
+    raise ValueError(f"Unsupported flow_start_mode='{mode}'. Expected 'source' or 'noise'.")
+
+
+def _resolve_edit_noise_scale(cfg: DictConfig, arg_value: float | None) -> float:
+    value = float(cfg.get("edit_noise_scale", 0.0) if arg_value is None else arg_value)
+    return max(value, 0.0)
+
+
+def _make_initial_tokens(source_tokens: torch.Tensor, flow_start_mode: str, edit_noise_scale: float) -> torch.Tensor:
+    if flow_start_mode == "noise":
+        return torch.randn_like(source_tokens)
+    z = source_tokens
+    if edit_noise_scale > 0.0:
+        z = z + edit_noise_scale * torch.randn_like(z)
+    return z
+
+
 def main() -> None:
     args = _parse_args()
     torch.manual_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     checkpoint = _load_checkpoint_blob(Path(args.checkpoint), device)
     cfg = _config_from_checkpoint_or_file(checkpoint, args.config_name)
+    flow_start_mode = _resolve_flow_start_mode(cfg, args.flow_start_mode)
+    edit_noise_scale = _resolve_edit_noise_scale(cfg, args.edit_noise_scale)
 
     model = instantiate(cfg.model).to(device).eval()
     light_encoder = instantiate(cfg.light_encoder).to(device).eval()
@@ -167,7 +194,10 @@ def main() -> None:
             )
             transfer = light_transfer_transformer(source_image, source_light, target_light, physics)
             source_tokens = tokenizer.encode(source_image)
-            z = torch.randn_like(source_tokens)
+            z = _make_initial_tokens(source_tokens, flow_start_mode, edit_noise_scale)
+            model_dtype = next(model.parameters()).dtype
+            z = z.to(dtype=model_dtype)
+            source_tokens = source_tokens.to(dtype=model_dtype)
             light_cond = torch.cat([source_light, target_light, target_light - source_light], dim=1)
             cond = {
                 "y": torch.zeros(1, dtype=torch.long, device=device),

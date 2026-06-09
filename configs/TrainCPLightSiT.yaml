@@ -65,6 +65,8 @@ allow_freeze_without_pretrain: false
 detach_dense_cond_from_flow: false
 enable_image_space_losses: false
 decode_loss_every: 0
+flow_start_mode: source
+edit_noise_scale: 0.02
 debug_one_batch: false
 q_clip: 2.0
 transfer_smooth_l1_beta: 0.1

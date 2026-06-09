@@ -71,7 +71,8 @@ The default Hydra config is `configs/TrainCPLightSiT.yaml`.
 - Learning rates: condition adapters and light-transfer transformer `3e-5`, diffusion backbone partial fine-tuning `1e-5`
 - Data loading: `24` workers, `prefetch_factor=8`
 - Precision/performance: `bf16` AMP, CUDA batch prefetch, channels-last image tensors
-- Conditioning: additive adapters plus cross-attention over light, dense-transfer, and source-latent context tokens
+- Conditioning: cross-attention over light, dense-transfer, and source-latent context tokens; additive condition adapters are disabled by default
+- Flow start: source VAE latent tokens with `edit_noise_scale=0.02`
 - Epochs: `100`
 - Dataset root: `data/VIDIT_HF`
 - Hugging Face dataset: `Nahrawy/VIDIT-Depth-ControlNet`
@@ -192,7 +193,7 @@ checkpoint/001_RayEncoder/checkpoint/ray_encoder_best.pth
 checkpoint/latest_RayEncoder.txt
 ```
 
-Stage 2 finetunes CP-LightSiT with the pretrained SiT backbone mostly frozen, frozen pretrained RayEncoder, trainable condition adapters, trainable condition cross-attention, trainable `LightTransferTransformer`, and the minimal objective. By default, the last 4 DiT blocks, input embedder, and final layer are also fine-tuned with a lower backbone LR:
+Stage 2 finetunes CP-LightSiT with the pretrained SiT backbone mostly frozen, frozen pretrained RayEncoder, trainable condition cross-attention, trainable `LightTransferTransformer`, and the minimal source-editing objective. By default, additive condition adapters are disabled, and the last 4 DiT blocks, input embedder, and final layer are also fine-tuned with a lower backbone LR:
 
 ```bash
 python train.py -cn TrainCPLightSiT_Minimal \
@@ -227,7 +228,7 @@ The default objective is intentionally small for stable fine-tuning:
 L_total = L_flow + lambda_transfer * L_transfer
 ```
 
-- `L_flow`: Rectified Flow / Flow Matching velocity MSE on target image tokens.
+- `L_flow`: Rectified Flow / Flow Matching velocity MSE from source VAE latent tokens to target image tokens. With `flow_start_mode=source`, the model learns relighting as image editing instead of unconditional image creation.
 - `L_transfer`: SmoothL1 loss between the predicted dense log-luminance transfer map `delta_l` and the VIDIT target-source log-luminance transfer `q_star`.
 - `q_star` is clipped by `q_clip=2.0` by default.
 - Shadow, reflectance, physics-correlation, linearity, smoothness, ray-rotation, tokenizer-reconstruction, and endpoint image-space losses have been removed from the trainer.
@@ -274,7 +275,7 @@ Checkpoints are written under each numbered run's `checkpoint/` subdirectory. Th
 python scripts/sample_cplightsit.py --checkpoint checkpoint/001_CPLightSiT/checkpoint/best.pth --source-image examples/source.png --target-direction E --target-temperature 5500 --output outputs/relit_E.png --save-debug-maps
 ```
 
-The sampler estimates the source ray from the input image, builds an absolute target light from direction and temperature, computes physics and refined dense transfer maps, samples target tokens with `TrajectoryFlow`, decodes tokens, and optionally saves debug maps. Passing `--target-rotation-deg` instead rotates the estimated source ray by that angle before building the target condition.
+The sampler estimates the source ray from the input image, builds an absolute target light from direction and temperature, computes physics and refined dense transfer maps, starts `TrajectoryFlow` from the source VAE tokens, decodes edited target tokens, and optionally saves debug maps. Passing `--target-rotation-deg` instead rotates the estimated source ray by that angle before building the target condition.
 
 ## Inference Report
 
@@ -302,11 +303,11 @@ The report includes MAE, MSE, RMSE, PSNR, SSIM, luminance MAE, log-transfer L1, 
 - `CPLightSiT`: token-space DiT with global light condition, dense condition, and source-token injection.
 - `TrajectoryFlow`: rectified-flow objective with a mask-compatible interface.
 
-During training, the estimated or ground-truth source ray is rotated by the VIDIT source-to-target azimuth delta. The rotated ray is converted back to the target light condition and is used by both `PhysicsLightTransfer` and `CPLightSiT`.
+During training, the estimated or ground-truth source ray is rotated by the VIDIT source-to-target azimuth delta. The rotated ray is converted back to the target light condition and is used by both `PhysicsLightTransfer` and `CPLightSiT`. The flow path starts from the source VAE tokens, optionally with small noise, and ends at the target VAE tokens.
 
 ## Losses
 
-- Flow MSE: velocity prediction loss in token space.
+- Flow MSE: source-token-to-target-token velocity prediction loss in VAE latent token space.
 - Dense transfer SmoothL1: stabilizes the physical light-transfer condition.
 
 ## Known Limitations

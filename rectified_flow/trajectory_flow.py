@@ -14,6 +14,8 @@ class TrajectoryFlow(RectifiedFlow):
         x: torch.Tensor,
         cond: Any,
         mask: torch.Tensor,
+        x0: Optional[torch.Tensor] = None,
+        x0_noise_scale: float = 0.0,
         timestep_shift: float = 0.1,
         bg_noise_ratio: float = 0.5,
         transition_width: float = 0.1,
@@ -25,6 +27,8 @@ class TrajectoryFlow(RectifiedFlow):
         return super().forward(
             x=x,
             cond=cond,
+            x0=x0,
+            x0_noise_scale=x0_noise_scale,
             timestep_shift=timestep_shift,
             losses=losses,
             description=description,
